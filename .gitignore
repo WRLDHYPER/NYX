@@ -1,0 +1,6 @@
+__pycache__/
+blobs/
+voices/
+manifests/
+*.onnx
+*.json
