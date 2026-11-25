@@ -2,6 +2,9 @@ __pycache__/
 blobs/
 voices/
 manifests/
+manifests-v2/
+metadata/
 *.onnx
-*.jsonprevious_chats.txt
+*.json
+previous_chats.txt
 nyx_app.log
