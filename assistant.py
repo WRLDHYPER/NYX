@@ -11,17 +11,40 @@ import struct
 import msvcrt
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from collections import deque
 
+import difflib
+
 import numpy as np
 import librosa
-import soundfile as sf
 import pyaudio
 import requests
 import sounddevice as sd
 from piper import PiperVoice
 from faster_whisper import WhisperModel
+from faster_whisper.vad import get_vad_model
+
+try:
+    from scipy.signal import butter, sosfilt
+    _HIGHPASS_SOS = butter(4, 80, btype="highpass", fs=16000, output="sos")
+except Exception:
+    _HIGHPASS_SOS = None
+
+# -------------------------------------------------------------------
+# Event hook (used by the GUI). Console mode leaves this as None.
+# -------------------------------------------------------------------
+EVENT_SINK = None
+
+def emit(kind, **data):
+    """Send an event to the GUI (if attached). Never raises."""
+    if EVENT_SINK is None:
+        return
+    try:
+        EVENT_SINK({"type": kind, **data})
+    except Exception:
+        pass
 
 # -------------------------------------------------------------------
 # Optional libraries for volume/brightness control
@@ -70,22 +93,10 @@ DEFAULT_SPEECH_SPEED = 0.5
 # -------------------------------------------------------------------
 # Piper Voice Configuration
 # -------------------------------------------------------------------
-VOICES_DIR = Path(r"C:\EDITH\voices")
+APP_DIR = Path(__file__).resolve().parent   # works whatever the folder is called
+VOICES_DIR = APP_DIR / "voices"
 SELECTED_VOICE = "en_GB-vctk-medium"
 PIPER_MODEL_PATH = VOICES_DIR / f"{SELECTED_VOICE}.onnx"
-
-if not PIPER_MODEL_PATH.is_file():
-    print(f"[-] Model '{SELECTED_VOICE}.onnx' not found in {VOICES_DIR}.")
-    available = list(VOICES_DIR.glob("*.onnx"))
-    if available:
-        print("[+] Available models:")
-        for f in available:
-            print(f"    - {f.stem}")
-    else:
-        print("[-] No .onnx models found at all.")
-    PIPER_MODEL_PATH = None
-else:
-    print(f"[+] Using Piper model: {PIPER_MODEL_PATH}")
 
 # Safe local access policy
 USER_HOME = Path.home()
@@ -93,36 +104,57 @@ ALLOWED_READ_ROOTS = [
     (Path.cwd()).resolve(),
     (USER_HOME / "Documents").resolve(),
     (USER_HOME / "Desktop").resolve(),
-    Path(r"C:\EDITH").resolve(),
+    APP_DIR,
 ]
 ALLOWED_URL_HOSTS = {"*"}
 
-# VAD Thresholds
-SILENCE_THRESHOLD = 900
-SILENCE_DURATION = 1.5
+# -------------------------------------------------------------------
+# Listening / VAD settings
+# The trigger level adapts to the room: it is NOISE_MULTIPLIER x the
+# measured background noise, but never below MIN_TRIGGER_RMS.
+# A trigger is only accepted if the Silero neural VAD agrees it is speech.
+# -------------------------------------------------------------------
+MIN_TRIGGER_RMS = 180.0
+NOISE_MULTIPLIER = 2.8
+VAD_SPEECH_PROB = 0.5          # Silero probability counted as speech
+SILENCE_DURATION = 0.9         # seconds of non-speech that end a command
+NO_SPEECH_TIMEOUT = 3.0        # give up if nothing is said after a trigger
 MAX_RECORD_TIME = 25.0
-LISTEN_COOLDOWN_SECONDS = 1.5
-PRE_ROLL_CHUNKS = 6
+LISTEN_COOLDOWN_SECONDS = 0.4
+PRE_ROLL_CHUNKS = 8            # ~0.64 s kept from before the trigger
 
-WHISPER_CONTEXT_PROMPT = (
-    "Hey Nix, what time is it? Open YouTube. Open GitHub. Open Roblox. "
-    "Read the file. Shut down the system. Cancel shutdown. Confirm. "
-    "Use the smart model and think deeply about this. Back to normal mode. "
-    "Hey Nyx, help me with this."
-)
+# Whisper settings
+WHISPER_MODELS = ("large-v3", "distil-large-v3", "large-v2", "medium", "small")
+WHISPER_CONTEXT_PROMPT = "Nyx, open YouTube. Nyx, what time is it? Set volume to 40."
+WHISPER_HOTWORDS = "Nyx"
+
+# Things Whisper commonly invents from silence or noise.
+HALLUCINATIONS = {
+    "thank you", "thanks", "thank you.", "thanks for watching", "thank you for watching",
+    "thanks for watching!", "please subscribe", "subscribe", "you", "bye", "okay",
+    "so", "uh", "um", "hmm", "the end", ".", "...",
+}
+
+# Ways Whisper tends to spell the wake word "Nyx"/"Nix".
+WAKE_ALIASES = {
+    "nyx", "nix", "nicks", "nics", "niks", "nyxs", "knicks", "knix", "nyks",
+    "nikks", "nick", "nicke", "nyck", "nicks,", "nixs", "nyxx", "onyx",
+}
 
 SHUTDOWN_CONFIRMATION_PENDING = False
 SHUTDOWN_COUNTDOWN_ACTIVE = False
 SPEAKING_IN_PROGRESS = False
 POST_SPEAK_COOLDOWN = 0.3
+LISTENING_ENABLED = True
+STOP_TTS = False
+SPEECH_VOLUME = 100  # 0-100, controls TTS gain
 
 # -------------------------------------------------------------------
 # Chat History & Logging
 # -------------------------------------------------------------------
-chat_history = deque(maxlen=20)  # store last 20 exchanges (role, content)
+chat_history = deque(maxlen=20)
 last_assistant_reply = ""
 
-# Determine script directory for log file
 try:
     SCRIPT_DIR = Path(__file__).parent
 except NameError:
@@ -138,10 +170,6 @@ def log_conversation(user_text, assistant_reply):
         f.write("-" * 40 + "\n")
 
 def read_chat_log(full=False):
-    """
-    Return the contents of the chat log with a special prefix for console-only output.
-    If full=True, returns the entire file. Otherwise, returns only the last 10 exchanges.
-    """
     if not CHAT_LOG_FILE.exists():
         return "CHAT_LOG:No previous chats found yet."
     try:
@@ -151,16 +179,14 @@ def read_chat_log(full=False):
         if full:
             return f"CHAT_LOG:{content}"
 
-        # --- Extract last 10 exchanges (user + assistant pairs) ---
         lines = content.splitlines()
         exchanges = []
         current_user = None
         current_assistant = None
         for line in lines:
             line = line.strip()
-            if not line or line.startswith("-" * 10):  # skip separator lines
+            if not line or line.startswith("-" * 10):
                 continue
-            # Match user or assistant lines
             user_match = re.match(r'^\[.*?\]\s+User:\s+(.*)$', line)
             assistant_match = re.match(r'^\[.*?\]\s+Nyx:\s+(.*)$', line)
             if user_match:
@@ -171,12 +197,10 @@ def read_chat_log(full=False):
                     exchanges.append((current_user, current_assistant))
                     current_user = None
                     current_assistant = None
-        # Take last 10 pairs
         last_10 = exchanges[-10:] if exchanges else []
         if not last_10:
             return "CHAT_LOG:No complete exchanges found."
 
-        # Format the output
         output = f"Last {len(last_10)} chat exchanges:\n"
         output += "=" * 60 + "\n"
         for i, (user, assistant) in enumerate(last_10, 1):
@@ -188,14 +212,12 @@ def read_chat_log(full=False):
         return f"CHAT_LOG:Could not read chat log: {e}"
 
 # -------------------------------------------------------------------
-# Volume & Brightness control functions (UPDATED – no PowerShell)
+# Volume & Brightness control functions
 # -------------------------------------------------------------------
 def set_system_volume(level):
-    """Set system volume to level (0-100) using best available method."""
     if level < 0 or level > 100:
         return "Volume must be between 0 and 100."
 
-    # Try pycaw (modern)
     try:
         from pycaw.pycaw import AudioUtilities
         volume = AudioUtilities.GetSpeakers().GetEndpointVolume()
@@ -204,7 +226,6 @@ def set_system_volume(level):
     except Exception:
         pass
 
-    # Try pycaw (old method)
     try:
         from ctypes import cast, POINTER
         from comtypes import CLSCTX_ALL
@@ -218,16 +239,26 @@ def set_system_volume(level):
     except Exception:
         pass
 
-    # Try nircmd
     try:
         nircmd_path = shutil.which("nircmd")
         if nircmd_path:
-            subprocess.run([nircmd_path, "setsysvolume", str(int(level * 655.35)), "0"], check=False, capture_output=True)
-            return f"Volume set to {level}% (using nircmd)."
+            val = int(level * 655.35)
+            result = subprocess.run(
+                [nircmd_path, "setsysvolume", str(val), "0"],
+                check=False, capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                return f"Volume set to {level}% (using nircmd)."
+            else:
+                result2 = subprocess.run(
+                    [nircmd_path, "setvolume", "0", str(level)],
+                    check=False, capture_output=True, text=True
+                )
+                if result2.returncode == 0:
+                    return f"Volume set to {level}% (using nircmd setvolume)."
     except Exception:
         pass
 
-    # Try SoundVolumeView (another Nirsoft tool)
     try:
         svc_path = shutil.which("SoundVolumeView.exe")
         if svc_path:
@@ -236,13 +267,11 @@ def set_system_volume(level):
     except Exception:
         pass
 
-    # Final suggestion
     return ("Volume control failed. Please run the assistant as Administrator "
             "and ensure 'pycaw' is installed (pip install pycaw comtypes). "
             "Alternatively, install 'nircmd' (https://nircmd.nirsoft.net/) and place it in your PATH.")
 
 def set_system_brightness(level):
-    """Set system brightness to level (0-100). Returns a status message."""
     if level < 0 or level > 100:
         return "Brightness must be between 0 and 100."
     try:
@@ -250,7 +279,6 @@ def set_system_brightness(level):
             sbc.set_brightness(level)
             return f"Brightness set to {level}%."
         else:
-            # Fallback via PowerShell
             try:
                 subprocess.run(
                     ["powershell", "-c",
@@ -264,19 +292,75 @@ def set_system_brightness(level):
         return f"Failed to set brightness: {e}"
 
 # -------------------------------------------------------------------
-# 1. Initialize Piper Text-to-Speech Engine
+# Speech Volume (TTS volume) control
 # -------------------------------------------------------------------
-print("[+] Loading Piper TTS voice model...")
+def set_speech_volume(level):
+    """Set TTS volume (0-100). Returns a status message."""
+    global SPEECH_VOLUME
+    if level < 0 or level > 100:
+        return "Speech volume must be between 0 and 100."
+    SPEECH_VOLUME = level
+    return f"Speech volume set to {level}%."
+
+# -------------------------------------------------------------------
+# 1. Piper Text-to-Speech Engine (loaded in init_engine)
+# -------------------------------------------------------------------
 piper_voice = None
-try:
-    piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
-    print("[+] Piper TTS loaded successfully.")
-except Exception as err:
-    print(f"[-] Could not load Piper model from '{PIPER_MODEL_PATH}': {err}")
+
+def load_piper():
+    global piper_voice
+    path = PIPER_MODEL_PATH
+    if not path.is_file():
+        available = list(VOICES_DIR.glob("*.onnx"))
+        print(f"[-] Voice '{SELECTED_VOICE}.onnx' not found in {VOICES_DIR}.")
+        if not available:
+            print("[-] No .onnx voices found. Speech output disabled.")
+            return
+        path = available[0]
+        print(f"[+] Falling back to voice: {path.stem}")
+    print(f"[+] Loading Piper TTS voice: {path.name}")
+    try:
+        piper_voice = PiperVoice.load(path)
+        print("[+] Piper TTS loaded successfully.")
+    except Exception as err:
+        print(f"[-] Could not load Piper model from '{path}': {err}")
+
+TTS_LEAD_SILENCE = 0.15   # Bluetooth headphones often swallow the first syllable
+TTS_TAIL_SILENCE = 0.6    # ...and the last words if the stream closes too early
+
+def _play_audio(audio_np, sample_rate):
+    global SPEAKING_IN_PROGRESS, STOP_TTS
+    try:
+        lead = np.zeros(int(sample_rate * TTS_LEAD_SILENCE), dtype=np.float32)
+        tail = np.zeros(int(sample_rate * TTS_TAIL_SILENCE), dtype=np.float32)
+        audio_np = np.concatenate([lead, audio_np.astype(np.float32), tail])
+        duration = len(audio_np) / float(sample_rate)
+
+        sd.play(audio_np, samplerate=sample_rate, latency="high")
+        start = time.time()
+        try:
+            latency = float(sd.get_stream().latency or 0.0)
+        except Exception:
+            latency = 0.2
+        # Wait for the whole clip (plus device latency) instead of trusting
+        # stream.active, which goes false while audio is still buffered.
+        while True:
+            if STOP_TTS:
+                print("[TTS] Skipped by user.")
+                break
+            if time.time() - start >= duration + latency + 0.1:
+                break
+            time.sleep(0.02)
+    except Exception as e:
+        print(f"[-] Playback error: {e}")
+    finally:
+        sd.stop()
+        SPEAKING_IN_PROGRESS = False
+        STOP_TTS = False
+        emit("state", value="idle")
 
 def speak(text, speaker_id=0, speed=1):
-    """Synthesize and speak text, muting microphone during playback."""
-    global SPEAKING_IN_PROGRESS
+    global SPEAKING_IN_PROGRESS, STOP_TTS, SPEECH_VOLUME
     if not text:
         return
 
@@ -286,7 +370,15 @@ def speak(text, speaker_id=0, speed=1):
         print("[-] Piper TTS unavailable. Skipping speech.")
         return
 
+    # Wait for the previous sentence to finish instead of dropping this one.
+    deadline = time.time() + 60
+    while SPEAKING_IN_PROGRESS and time.time() < deadline:
+        time.sleep(0.05)
+
     SPEAKING_IN_PROGRESS = True
+    STOP_TTS = False
+    emit("state", value="speaking")
+
     try:
         sample_rate = getattr(piper_voice.config, 'sample_rate', 22050)
         wav_buffer = io.BytesIO()
@@ -307,73 +399,184 @@ def speak(text, speaker_id=0, speed=1):
         wav_buffer.seek(0)
 
         with wave.open(wav_buffer, 'rb') as wf:
-            out_channels = wf.getnchannels()
-            out_width = wf.getsampwidth()
             out_rate = wf.getframerate()
             audio_bytes = wf.readframes(wf.getnframes())
 
         if not audio_bytes:
             print("[-] Piper synthesized empty audio buffer.")
+            SPEAKING_IN_PROGRESS = False
+            emit("state", value="idle")
             return
+
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+        gain = SPEECH_VOLUME / 100.0
+        if gain != 1.0:
+            audio_np = np.clip(audio_np * gain, -1.0, 1.0)
 
         if speed != 1.0:
             try:
-                audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                try:
-                    audio_np = librosa.effects.time_stretch(audio_np, rate=speed)
-                    print(f"[+] Using librosa for speed {speed:.2f}x (pitch preserved)")
-                except ImportError:
-                    print("[-] librosa not found – falling back to resampling (quality loss)")
-                    out_rate = int(out_rate * speed)
-                else:
-                    audio_np = np.clip(audio_np, -1.0, 1.0) * 32767
-                    audio_bytes = audio_np.astype(np.int16).tobytes()
+                audio_np = librosa.effects.time_stretch(audio_np, rate=speed)
             except Exception as e:
                 print(f"[-] Speed adjustment failed: {e}. Using original speed.")
 
-        out_stream = audio_interface.open(
-            format=audio_interface.get_format_from_width(out_width),
-            channels=out_channels,
-            rate=out_rate,
-            output=True
-        )
-        out_stream.write(audio_bytes)
-        out_stream.stop_stream()
-        out_stream.close()
+        thread = threading.Thread(target=_play_audio, args=(audio_np, out_rate))
+        thread.daemon = True
+        thread.start()
 
     except Exception as e:
         print(f"[-] Piper speech execution failed: {type(e).__name__} - {e}")
-    finally:
         SPEAKING_IN_PROGRESS = False
+        STOP_TTS = False
+        emit("state", value="idle")
+
+def stop_speaking():
+    """Interrupt the current TTS playback."""
+    global STOP_TTS
+    if SPEAKING_IN_PROGRESS:
+        STOP_TTS = True
+        sd.stop()
+        return True
+    return False
 
 # -------------------------------------------------------------------
-# 2. Initialize Speech Recognition & Wake Word Engine
+# 2. Speech Recognition (Faster-Whisper) + Silero VAD
 # -------------------------------------------------------------------
-print("[+] Loading Faster-Whisper STT model on CUDA GPU...")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
 stt_model = None
-for model_name in ("large-v2", "large", "medium", "small", "tiny"):
-    try:
-        stt_model = WhisperModel(
-            model_name,
-            device=STT_DEVICE,
-            compute_type="float16",
-            local_files_only=True,
-        )
-        print(f"[+] Whisper model loaded successfully: {model_name}")
-        break
-    except Exception as e:
-        print(f"[-] Could not load Whisper model '{model_name}' locally: {e}")
+vad_model = None
+STT_MODEL_NAME = None
 
-if stt_model is None:
+def load_whisper():
+    """Load the most accurate cached Whisper model the hardware can run."""
+    global stt_model
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    attempts = []
+    if STT_DEVICE == "cuda":
+        attempts += [("cuda", "float16"), ("cuda", "int8_float16")]
+    attempts += [("cpu", "int8")]
+    for model_name in WHISPER_MODELS:
+        for device, compute in attempts:
+            try:
+                stt_model = WhisperModel(
+                    model_name, device=device, compute_type=compute, local_files_only=True,
+                )
+                global STT_MODEL_NAME
+                STT_MODEL_NAME = model_name
+                print(f"[+] Whisper '{model_name}' loaded on {device} ({compute}).")
+                return
+            except Exception as e:
+                msg = str(e).splitlines()[0][:120] if str(e) else type(e).__name__
+                print(f"[-] Whisper '{model_name}' on {device}/{compute} unavailable: {msg}")
+                # Model missing from cache: no point trying other devices.
+                if "local" in msg.lower() or "snapshot" in msg.lower() or "not find" in msg.lower():
+                    break
     raise RuntimeError(
-        "No local Whisper model could be loaded. Install a cached model first or set HF_TOKEN."
+        "No local Whisper model could be loaded. Download one first, e.g. "
+        "py -3.11 -c \"from faster_whisper import WhisperModel; WhisperModel('large-v3')\""
     )
 
-oww_model = None
-print("[+] OpenWakeWord disabled – using Whisper-based wake phrase detection.")
+def load_vad():
+    global vad_model
+    try:
+        vad_model = get_vad_model()
+        print("[+] Silero VAD loaded.")
+    except Exception as e:
+        vad_model = None
+        print(f"[-] Silero VAD unavailable ({e}); falling back to energy detection.")
 
+def pcm_to_float(pcm_bytes):
+    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+def get_rms(chunk_data):
+    arr = np.frombuffer(chunk_data, dtype=np.int16).astype(np.float32)
+    if arr.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(arr * arr)))
+
+def speech_probability(pcm_bytes):
+    """Highest Silero speech probability in the given audio (0..1)."""
+    if vad_model is None:
+        return 1.0
+    audio = pcm_to_float(pcm_bytes)
+    usable = (audio.size // 512) * 512
+    if usable == 0:
+        return 0.0
+    try:
+        probs = vad_model(audio[-usable:].copy())
+        return float(np.max(probs))
+    except Exception:
+        return 1.0
+
+def preprocess_audio(pcm_bytes):
+    """Clean up mic audio before Whisper: DC removal, rumble filter, gain."""
+    audio = pcm_to_float(pcm_bytes)
+    if audio.size == 0:
+        return audio
+    audio = audio - float(np.mean(audio))
+    if _HIGHPASS_SOS is not None:
+        audio = sosfilt(_HIGHPASS_SOS, audio).astype(np.float32)
+    peak = float(np.max(np.abs(audio)))
+    if 1e-4 < peak < 0.7:
+        gain = min(0.7 / peak, 12.0)   # boost quiet speakers, cap noise boost
+        audio = audio * gain
+    return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+def _clean_segment_text(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+def transcribe_full(pcm_bytes):
+    """Transcribe raw 16 kHz int16 PCM. Returns '' for noise/hallucinations."""
+    audio = preprocess_audio(pcm_bytes)
+    if audio.size < RATE * 0.25:
+        return ""
+    kwargs = dict(
+        language="en",
+        beam_size=5,
+        best_of=5,
+        temperature=[0.0, 0.2, 0.4, 0.6],
+        condition_on_previous_text=False,
+        without_timestamps=True,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=250, threshold=0.45),
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+        initial_prompt=WHISPER_CONTEXT_PROMPT,
+        hotwords=WHISPER_HOTWORDS,
+    )
+    try:
+        segments, _ = stt_model.transcribe(audio, **kwargs)
+        segments = list(segments)
+    except TypeError:
+        kwargs.pop("hotwords", None)
+        segments, _ = stt_model.transcribe(audio, **kwargs)
+        segments = list(segments)
+
+    kept = []
+    for seg in segments:
+        text = _clean_segment_text(seg.text)
+        if not text:
+            continue
+        # Low-confidence segments that Whisper also thinks are silence: drop.
+        if seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.7:
+            continue
+        if seg.avg_logprob < -1.2:
+            continue
+        kept.append(text)
+
+    result = " ".join(kept).strip()
+    lowered = result.lower().strip(" .!?,")
+    if not lowered or lowered in HALLUCINATIONS:
+        return ""
+    # Whisper sometimes echoes the whole prompt back on noise.
+    prompt = WHISPER_CONTEXT_PROMPT.lower().strip(" .!?,")
+    if difflib.SequenceMatcher(None, lowered, prompt).ratio() > 0.85:
+        return ""
+    return result
+
+# -------------------------------------------------------------------
+# Wake word handling (fuzzy, tolerant of Whisper's spellings)
+# -------------------------------------------------------------------
 def normalize_transcript(text):
     if not text:
         return ""
@@ -383,37 +586,45 @@ def normalize_transcript(text):
     normalized = " ".join(normalized.split())
     return normalized
 
-def contains_wake_phrase(text):
-    normalized = normalize_transcript(text)
-    if not normalized:
+def _is_wake_token(token, near_start):
+    token = token.strip(",.!?")
+    if token in ("nyx", "nix"):
+        return True
+    if not near_start:
         return False
-    wake_variants = ["hey nix", "hey nyx", "nix", "nyx"]
-    for variant in wake_variants:
-        if normalized == variant:
-            return True
-        if normalized.startswith(variant):
-            return True
-        if f" {variant} " in normalized:
-            return True
-        if normalized.endswith(variant):
-            return True
+    if token in WAKE_ALIASES:
+        return True
+    if 3 <= len(token) <= 5:
+        best = max(difflib.SequenceMatcher(None, token, w).ratio() for w in ("nyx", "nix", "nyxs"))
+        return best >= 0.8
     return False
 
-# kept for compatibility, but not used anymore
+def find_wake_word(text):
+    """Return (start, end) word indices of the wake phrase, or None."""
+    words = normalize_transcript(text).split()
+    for i, word in enumerate(words):
+        if _is_wake_token(word, near_start=i < 4):
+            start = i - 1 if i > 0 and words[i - 1].strip(",.!?") in ("hey", "hi", "okay", "ok", "yo") else i
+            return start, i + 1
+    return None
+
+def contains_wake_phrase(text):
+    return find_wake_word(text) is not None
+
+def strip_wake_word(text):
+    """Remove the wake phrase so only the command remains."""
+    span = find_wake_word(text)
+    if span is None:
+        return (text or "").strip()
+    words = (text or "").split()
+    # normalize_transcript may drop punctuation-only tokens; fall back safely.
+    if len(words) != len(normalize_transcript(text).split()):
+        return re.sub(r'^\W*(?:hey\s+)?\w+[\s,.!?]*', '', text or "", count=1).strip()
+    remainder = words[:span[0]] + words[span[1]:]
+    return " ".join(remainder).strip(" ,.!?") or "hello"
+
 def extract_command_text(text):
-    normalized = normalize_transcript(text)
-    if not normalized:
-        return "hello"
-    patterns = [
-        r"(?:hey\s+)?(?:nix|nyx)\s*",
-        r"\b(?:nix|nyx)\b\s*",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, normalized, flags=re.IGNORECASE)
-        if match:
-            remainder = normalized[match.end():].strip(" ,!?.")
-            return remainder if remainder else "hello"
-    return normalized.strip(" ,!?.") or "hello"
+    return strip_wake_word(text)
 
 def looks_like_followup_answer(text):
     normalized = normalize_transcript(text)
@@ -429,48 +640,54 @@ def looks_like_followup_answer(text):
     }
     if normalized in short_answers:
         return True
-    for answer in short_answers:
-        if normalized.startswith(answer):
-            return True
-    return False
+    return any(normalized.startswith(answer) for answer in short_answers)
 
 # -------------------------------------------------------------------
-# 3. Audio Recording & Dynamic VAD Logic
+# 3. Microphone, adaptive noise floor & recording
 # -------------------------------------------------------------------
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+CHUNK = 1280            # 80 ms at 16 kHz
+RATE = 16000
+
+audio_interface = None
+mic_stream = None
+MIC_DEVICE_INDEX = None
+noise_floor = 120.0
+
+def trigger_threshold():
+    return max(MIN_TRIGGER_RMS, noise_floor * NOISE_MULTIPLIER)
+
+def update_noise_floor(rms):
+    """Track background noise slowly; ignore loud frames (likely speech)."""
+    global noise_floor
+    if rms < noise_floor * 2.0 or rms < MIN_TRIGGER_RMS:
+        noise_floor = 0.97 * noise_floor + 0.03 * max(rms, 20.0)
+
 def choose_microphone_index():
     preferred_names = ["hyperx", "duocast", "jbl", "steam streaming", "microphone"]
     candidates = []
     for i in range(audio_interface.get_device_count()):
         info = audio_interface.get_device_info_by_index(i)
         name = (info.get("name") or "").lower()
-        max_channels = int(info.get("maxInputChannels", 0))
-        if max_channels <= 0:
+        if int(info.get("maxInputChannels", 0)) <= 0:
             continue
         if any(token in name for token in ["virtual", "mapper", "stereo mix", "loopback", "wave"]):
             continue
         try:
             test_stream = audio_interface.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                input_device_index=i,
-                frames_per_buffer=1280,
+                format=pyaudio.paInt16, channels=1, rate=16000, input=True,
+                input_device_index=i, frames_per_buffer=CHUNK,
             )
-            test_data = test_stream.read(1280, exception_on_overflow=False)
-            arr = np.frombuffer(test_data, dtype=np.int16)
-            rms = math.sqrt(np.mean(np.square(arr.astype(np.float32))))
+            rms = get_rms(test_stream.read(CHUNK, exception_on_overflow=False))
             test_stream.stop_stream()
             test_stream.close()
         except Exception:
             continue
         if rms <= 5.0:
             continue
-        preference_score = 0
-        for token in preferred_names:
-            if token in name:
-                preference_score += 1
-        candidates.append((preference_score, float(rms), i, info.get("name")))
+        score = sum(1 for token in preferred_names if token in name)
+        candidates.append((score, rms, i, info.get("name")))
     if not candidates:
         return None
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -478,84 +695,77 @@ def choose_microphone_index():
     print(f"[+] Selected microphone: {mic_name} (index {chosen}, rms={rms_value:.2f})")
     return chosen
 
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-CHUNK = 1280
-
-audio_interface = pyaudio.PyAudio()
-MIC_DEVICE_INDEX = None
-for i in range(audio_interface.get_device_count()):
-    info = audio_interface.get_device_info_by_index(i)
-    name = (info.get("name") or "").lower()
-    if "hyperx" in name or "duocast" in name:
-        MIC_DEVICE_INDEX = i
-        break
-
-if MIC_DEVICE_INDEX is None:
-    MIC_DEVICE_INDEX = choose_microphone_index()
-
-if MIC_DEVICE_INDEX is None:
-    raise RuntimeError("No working microphone input device was found.")
-
-RATE = 16000
-print(f"[+] Using mic at {RATE} Hz on index {MIC_DEVICE_INDEX}")
-speak("Hello sir, all systems are online.")
-
-mic_stream = audio_interface.open(
-    format=FORMAT,
-    channels=CHANNELS,
-    rate=RATE,
-    input=True,
-    input_device_index=MIC_DEVICE_INDEX,
-    frames_per_buffer=CHUNK
-)
-
-def get_rms(chunk_data):
-    count = len(chunk_data) / 2
-    format_str = "%dh" % count
-    shorts = struct.unpack(format_str, chunk_data)
-    sum_squares = sum([s**2 for s in shorts])
-    return math.sqrt(sum_squares / count)
-
-def transcribe_full(wav_buffer):
-    common_kwargs = dict(
-        beam_size=8,
-        best_of=5,
-        temperature=[0.0, 0.2, 0.4],
-        language="en",
-        condition_on_previous_text=False,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=300),
-        initial_prompt=WHISPER_CONTEXT_PROMPT,
+def open_microphone():
+    global audio_interface, mic_stream, MIC_DEVICE_INDEX
+    audio_interface = pyaudio.PyAudio()
+    MIC_DEVICE_INDEX = None
+    for i in range(audio_interface.get_device_count()):
+        name = (audio_interface.get_device_info_by_index(i).get("name") or "").lower()
+        if "hyperx" in name or "duocast" in name:
+            MIC_DEVICE_INDEX = i
+            break
+    if MIC_DEVICE_INDEX is None:
+        MIC_DEVICE_INDEX = choose_microphone_index()
+    if MIC_DEVICE_INDEX is None:
+        raise RuntimeError("No working microphone input device was found.")
+    mic_name = audio_interface.get_device_info_by_index(MIC_DEVICE_INDEX).get("name")
+    print(f"[+] Using mic '{mic_name}' at {RATE} Hz on index {MIC_DEVICE_INDEX}")
+    mic_stream = audio_interface.open(
+        format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
+        input_device_index=MIC_DEVICE_INDEX, frames_per_buffer=CHUNK,
     )
+    emit("mic_name", value=mic_name)
+
+def calibrate_noise(seconds=1.2):
+    """Measure room noise at startup so the trigger level fits the room."""
+    global noise_floor
+    levels = []
+    for _ in range(int(RATE / CHUNK * seconds)):
+        levels.append(get_rms(mic_stream.read(CHUNK, exception_on_overflow=False)))
+    if levels:
+        noise_floor = max(20.0, float(np.percentile(levels, 60)))
+    print(f"[+] Noise floor {noise_floor:.0f} RMS -> trigger at {trigger_threshold():.0f} RMS")
+
+def flush_mic():
+    """Discard audio buffered while we weren't reading (e.g. our own voice)."""
     try:
-        segments, _ = stt_model.transcribe(wav_buffer, hotwords="Nix Nyx", **common_kwargs)
-    except TypeError:
-        wav_buffer.seek(0)
-        segments, _ = stt_model.transcribe(wav_buffer, **common_kwargs)
-    return "".join(s.text for s in segments).strip()
+        available = mic_stream.get_read_available()
+        while available >= CHUNK:
+            mic_stream.read(CHUNK, exception_on_overflow=False)
+            available = mic_stream.get_read_available()
+    except Exception:
+        pass
 
 def record_until_silence(prefix_frames=None):
+    """Record until Silero VAD hears SILENCE_DURATION of non-speech."""
     print("[+] Listening... Speak your command now!")
+    emit("state", value="listening")
     frames = list(prefix_frames) if prefix_frames else []
-    silent_chunks = 0
     max_chunks = int(RATE / CHUNK * MAX_RECORD_TIME)
-    silence_chunk_limit = int(RATE / CHUNK * SILENCE_DURATION)
-    has_spoken = any(get_rms(f) > SILENCE_THRESHOLD for f in frames)
-    for _ in range(max_chunks):
+    silence_limit = max(1, int(RATE / CHUNK * SILENCE_DURATION))
+    no_speech_limit = int(RATE / CHUNK * NO_SPEECH_TIMEOUT)
+    has_spoken = bool(frames) and speech_probability(b"".join(frames[-4:])) >= VAD_SPEECH_PROB
+    silent_chunks = 0
+    for n in range(max_chunks):
         data = mic_stream.read(CHUNK, exception_on_overflow=False)
         frames.append(data)
         rms = get_rms(data)
-        if rms > SILENCE_THRESHOLD:
+        emit("level", rms=rms, threshold=trigger_threshold())
+        # Score the newest chunk with a little context from the previous one.
+        prob = speech_probability(b"".join(frames[-2:]))
+        is_speech = prob >= VAD_SPEECH_PROB or (vad_model is None and rms > trigger_threshold())
+        if is_speech:
             has_spoken = True
             silent_chunks = 0
-        else:
-            if has_spoken:
-                silent_chunks += 1
-        if has_spoken and silent_chunks >= silence_chunk_limit:
-            print("[+] Silence detected. End of voice input.")
+        elif has_spoken:
+            silent_chunks += 1
+        if has_spoken and silent_chunks >= silence_limit:
+            print("[+] End of speech detected.")
             break
-    return b''.join(frames)
+        if not has_spoken and n >= no_speech_limit:
+            print("[-] No speech after trigger.")
+            return b""
+    return b"".join(frames)
 
 # -------------------------------------------------------------------
 # 4. Safe local tools: time, file reads, and approved links
@@ -699,14 +909,8 @@ def quick_open_from_text(command_text):
 # Enhanced Application Opener
 # -------------------------------------------------------------------
 def open_application(command_text):
-    """
-    Try to open a Windows application by name.
-    Searches PATH, Start Menu, Program Files, System32, and common locations.
-    Returns a success message, or None if no application is found.
-    """
     print(f"[DEBUG] open_application called with: '{command_text}'")
 
-    # Extract the app name after 'open', 'launch', or 'start'
     match = re.search(r'\b(?:open|launch|start)\s+(.+?)(?:\s+app)?\s*$', command_text, re.IGNORECASE)
     if not match:
         print("[DEBUG] No app name found in command.")
@@ -716,23 +920,18 @@ def open_application(command_text):
         print("[DEBUG] App name is empty.")
         return None
 
-    # Remove trailing "app" if present
     if app_name.lower().endswith(" app"):
         app_name = app_name[:-4].strip()
     elif app_name.lower().endswith("app"):
         app_name = app_name[:-3].strip()
 
-    # Strip trailing punctuation (., !, ?, ;, :)
     app_name = re.sub(r'[.,!?;:]+$', '', app_name).strip()
-
     print(f"[DEBUG] Cleaned app name: '{app_name}'")
 
-    # If it looks like a URL, skip app search
     if '://' in app_name or app_name.lower().startswith('http'):
         print("[DEBUG] Looks like a URL, skipping app search.")
         return None
 
-    # --- Common alias mapping ---
     ALIASES = {
         "notepad": "notepad.exe",
         "calc": "calc.exe",
@@ -764,10 +963,8 @@ def open_application(command_text):
         "visual studio code": "code.exe",
     }
 
-    # Check if the app name is in the alias map
     if app_name.lower() in ALIASES:
         exe_name = ALIASES[app_name.lower()]
-        # Try to find the executable
         exe_path = shutil.which(exe_name)
         if exe_path:
             print(f"[DEBUG] Found alias '{app_name}' -> '{exe_name}' at {exe_path}")
@@ -814,8 +1011,6 @@ def open_application(command_text):
             print(f"[DEBUG] launch_shortcut failed: {e}")
             return False
 
-    # 1. Try PATH (with .exe if needed)
-    # If the app name doesn't have an extension, try with .exe
     exe_path = shutil.which(app_name)
     if not exe_path and not app_name.lower().endswith('.exe'):
         exe_path = shutil.which(app_name + '.exe')
@@ -824,24 +1019,17 @@ def open_application(command_text):
         if launch_exe(exe_path):
             return f"Opening {app_name}."
 
-    # 2. Search common directories (including System32)
     search_dirs = [
-        # Start Menu
         os.path.join(os.environ.get("ProgramData", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
         os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
-        # Program Files
         os.environ.get("ProgramFiles", "C:\\Program Files"),
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-        # AppData
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
         os.path.join(os.environ.get("APPDATA", ""), "Programs"),
-        # Desktop
         os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"),
         os.path.join(os.environ.get("PUBLIC", ""), "Desktop"),
-        # System folders (critical for Notepad, Calculator, etc.)
         os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32"),
         os.path.join(os.environ.get("SystemRoot", "C:\\Windows")),
-        # Additional common
         r"C:\Program Files\WindowsApps",
         os.path.join(os.environ.get("SystemDrive", "C:"), "Program Files\\Common Files"),
         os.path.join(os.environ.get("SystemDrive", "C:"), "Program Files (x86)\\Common Files"),
@@ -853,13 +1041,11 @@ def open_application(command_text):
         print(f"[DEBUG] Searching in: {base_dir}")
         try:
             for root, dirs, files in os.walk(base_dir):
-                # Limit depth to avoid too much scanning
                 depth = root.replace(base_dir, '').count(os.sep)
                 if depth > 4:
                     continue
                 for file in files:
                     file_lower = file.lower()
-                    # Check .lnk shortcuts
                     if file_lower.endswith(".lnk"):
                         name_no_ext = os.path.splitext(file)[0]
                         if app_name.lower() in name_no_ext.lower():
@@ -867,7 +1053,6 @@ def open_application(command_text):
                             print(f"[DEBUG] Found shortcut: {shortcut_path}")
                             if launch_shortcut(shortcut_path):
                                 return f"Opening {app_name}."
-                    # Check .exe files
                     elif file_lower.endswith(".exe"):
                         name_no_ext = os.path.splitext(file)[0]
                         if app_name.lower() in name_no_ext.lower():
@@ -879,7 +1064,6 @@ def open_application(command_text):
             print(f"[DEBUG] Error scanning {base_dir}: {e}")
             continue
 
-    # 3. Quick root scan in Program Files for launchers
     root_search = [
         os.environ.get("ProgramFiles", "C:\\Program Files"),
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
@@ -906,8 +1090,57 @@ def open_application(command_text):
 
     print(f"[DEBUG] No application found for: {app_name}")
     return None
+
 # -------------------------------------------------------------------
-# Main tool dispatcher (UPDATED: volume/brightness handled by keyword)
+# PC shutdown abort (voice, GUI button, console spacebar)
+# -------------------------------------------------------------------
+SHUTDOWN_SECONDS = 20
+
+def abort_shutdown():
+    global SHUTDOWN_CONFIRMATION_PENDING, SHUTDOWN_COUNTDOWN_ACTIVE
+    was_counting = SHUTDOWN_COUNTDOWN_ACTIVE
+    SHUTDOWN_CONFIRMATION_PENDING = False
+    SHUTDOWN_COUNTDOWN_ACTIVE = False
+    emit("shutdown", active=False, aborted=was_counting)
+    if not was_counting:
+        return "Shutdown cancelled."
+    try:
+        subprocess.run(["shutdown", "/a"], check=False, capture_output=True)
+        return "Shutdown Aborted."
+    except Exception as exc:
+        return f"Failed to cancel shutdown: {exc}"
+
+# -------------------------------------------------------------------
+# Minimize / restore (the GUI window, or the console window)
+# -------------------------------------------------------------------
+def set_window(action):
+    if EVENT_SINK is not None:
+        emit("window", action=action)
+    elif sys.platform == "win32":
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 6 if action == "minimize" else 9)
+                if action != "minimize":
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception as exc:
+            print(f"[-] Window control failed: {exc}")
+    return "Minimizing." if action == "minimize" else "I'm back."
+
+# -------------------------------------------------------------------
+# Toggle Listening Mode
+# -------------------------------------------------------------------
+def toggle_listening():
+    global LISTENING_ENABLED
+    LISTENING_ENABLED = not LISTENING_ENABLED
+    if LISTENING_ENABLED:
+        speak("Microphone on")
+    else:
+        speak("Microphone off")
+
+# -------------------------------------------------------------------
+# Main tool dispatcher
 # -------------------------------------------------------------------
 def handle_local_tools(command_text):
     global DEEP_MODE_PREFIX, SHUTDOWN_CONFIRMATION_PENDING, SHUTDOWN_COUNTDOWN_ACTIVE
@@ -916,33 +1149,37 @@ def handle_local_tools(command_text):
     if not text:
         return None
 
-    # DEBUG: print raw text before any processing
     print(f"[DEBUG] raw command_text: '{text}'")
 
-    # --- Strip common wake words from the beginning (case-insensitive) ---
     wake_pattern = r'^(?:hey\s+)?(?:nix|nyx)\s*,?\s*'
     text = re.sub(wake_pattern, '', text, flags=re.IGNORECASE).strip()
 
-    # Clean text: remove trailing punctuation and extra spaces
     clean_text = re.sub(r'[.,!?;:]+$', '', text).strip()
     lower_text = clean_text.lower()
-
     print(f"[DEBUG] cleaned lower_text: '{lower_text}'")
 
-    # --- VOLUME CONTROL ---
-    # First, check if the command is about volume
+    # --- MINIMIZE / RESTORE WINDOW ---
+    if re.search(r'\bminimi[sz]e\b|\bhide\s+(?:yourself|the\s+app|the\s+window)\b', lower_text):
+        return set_window("minimize")
+    if re.search(r'\b(?:restore|maximi[sz]e|show\s+yourself|show\s+the\s+app|come\s+back|full\s*screen)\b', lower_text):
+        return set_window("restore")
+
+    # --- SPEECH VOLUME CONTROL (handled locally) ---
+    vol_match = re.search(r'(?:set\s+)?speech\s+volume\s+(?:to\s+)?(\d{1,3})\s*%?', lower_text)
+    if vol_match:
+        level = int(vol_match.group(1))
+        return set_speech_volume(level)
+
+    # --- SYSTEM VOLUME CONTROL ---
     if re.search(r'\b(?:volume|vol)\b', lower_text):
-        # Try to extract the number
         vol_match = re.search(r'(?:volume|vol)\s*(?:to\s*)?(\d{1,3})\s*%?', lower_text)
         if vol_match:
             level = int(vol_match.group(1))
             if 0 <= level <= 100:
-                print(f"[DEBUG] Volume command matched: {level}%")
                 return set_system_volume(level)
             else:
                 return "Volume must be between 0 and 100."
         else:
-            # Volume command detected but no number found
             return "What volume level would you like? Please say a number between 0 and 100."
 
     # --- BRIGHTNESS CONTROL ---
@@ -951,7 +1188,6 @@ def handle_local_tools(command_text):
         if bright_match:
             level = int(bright_match.group(1))
             if 0 <= level <= 100:
-                print(f"[DEBUG] Brightness command matched: {level}%")
                 return set_system_brightness(level)
             else:
                 return "Brightness must be between 0 and 100."
@@ -968,13 +1204,7 @@ def handle_local_tools(command_text):
     # --- SHUTDOWN CANCELLATION ---
     if re.search(r'\b(abort|cancel|override)\b', lower_text):
         if SHUTDOWN_CONFIRMATION_PENDING or SHUTDOWN_COUNTDOWN_ACTIVE:
-            SHUTDOWN_CONFIRMATION_PENDING = False
-            SHUTDOWN_COUNTDOWN_ACTIVE = False
-            try:
-                subprocess.run(["shutdown", "/a"], check=False)
-                return "Shutdown Aborted."
-            except Exception as exc:
-                return f"Failed to cancel shutdown: {exc}"
+            return abort_shutdown()
 
     # --- PENDING SHUTDOWN CONFIRMATION ---
     if SHUTDOWN_CONFIRMATION_PENDING:
@@ -982,18 +1212,15 @@ def handle_local_tools(command_text):
             SHUTDOWN_CONFIRMATION_PENDING = False
             SHUTDOWN_COUNTDOWN_ACTIVE = True
             try:
-                subprocess.run(["shutdown", "/s", "/t", "20", "/c", "System shutdown confirmed."], check=False)
-                return "Shutting down the system in 20 seconds. Say 'abort' to cancel."
+                subprocess.run(["shutdown", "/s", "/t", str(SHUTDOWN_SECONDS),
+                                "/c", "System shutdown confirmed."], check=False)
+                emit("shutdown", active=True, deadline=time.time() + SHUTDOWN_SECONDS)
+                return f"Shutting down the system in {SHUTDOWN_SECONDS} seconds. Say 'abort' to cancel."
             except Exception as exc:
                 SHUTDOWN_COUNTDOWN_ACTIVE = False
                 return f"Failed to shutdown: {exc}"
         elif re.search(r'\b(no|nope|cancel|abort|override)\b', lower_text):
-            SHUTDOWN_CONFIRMATION_PENDING = False
-            try:
-                subprocess.run(["shutdown", "/a"], check=False)
-                return "Shutdown cancelled."
-            except Exception as exc:
-                return f"Failed to cancel shutdown: {exc}"
+            return abort_shutdown()
         else:
             return "Please confirm with 'confirm' or cancel with 'abort'."
 
@@ -1005,10 +1232,12 @@ def handle_local_tools(command_text):
 
     if re.search(r'\b(normal|standard|regular)\b', lower_text):
         DEEP_MODE_PREFIX = "normal"
+        emit("mode", deep=False)
         return "Back to normal mode."
 
     if re.search(r'\bdeep\b|\bthink\b|\bsmart model\b|\bdeep mode\b', lower_text):
         DEEP_MODE_PREFIX = "gwen"
+        emit("mode", deep=True)
         return "Entered deep thinking."
 
     if is_time_request(lower_text):
@@ -1022,7 +1251,7 @@ def handle_local_tools(command_text):
     if re.search(r'\b(?:read|show|open)\s+(?:previous\s+chats?|chat\s+log|the\s+text\s+file)\b', lower_text):
         return read_chat_log(full=False)
 
-    # --- READ ANY FILE (existing) ---
+    # --- READ ANY FILE ---
     if re.search(r'\b(read|open|show)\b.*\b(file|path|document)\b', lower_text, flags=re.IGNORECASE):
         return safe_read_file(text)
 
@@ -1092,154 +1321,269 @@ def ask_ollama_dual(prompt):
         return f"Error connecting to Ollama backend: {err}"
 
 # -------------------------------------------------------------------
+# Engine start-up
+# -------------------------------------------------------------------
+ENGINE_READY = False
+
+def init_engine(greet=True):
+    """Load models and open the microphone. Safe to call once."""
+    global ENGINE_READY
+    if ENGINE_READY:
+        return
+    emit("state", value="loading", detail="Loading voice")
+    load_piper()
+    emit("state", value="loading", detail="Loading speech recognition")
+    load_whisper()
+    load_vad()
+    emit("state", value="loading", detail="Opening microphone")
+    open_microphone()
+    emit("state", value="loading", detail="Measuring room noise")
+    calibrate_noise()
+    ENGINE_READY = True
+    emit("state", value="idle")
+    if greet:
+        speak("Hello sir, all systems are online.")
+
+def shutdown_engine():
+    try:
+        if mic_stream is not None:
+            mic_stream.stop_stream()
+            mic_stream.close()
+        if audio_interface is not None:
+            audio_interface.terminate()
+    except Exception:
+        pass
+
+# -------------------------------------------------------------------
+# Command processing (shared by voice and typed input)
+# -------------------------------------------------------------------
+followup_window_until = 0.0
+post_speak_cooldown_until = 0.0
+
+def set_listening(enabled):
+    global LISTENING_ENABLED
+    LISTENING_ENABLED = bool(enabled)
+    emit("mic", enabled=LISTENING_ENABLED)
+
+def process_command(command_text):
+    """Run one command. Returns False if the assistant should exit."""
+    global last_assistant_reply, followup_window_until, post_speak_cooldown_until
+
+    command_text = (command_text or "").strip()
+    if not command_text:
+        return True
+    emit("user", text=command_text)
+    lower = command_text.lower()
+
+    if re.search(r'\b(?:microphone|mic)\s+on\b|\bturn\s+on\s+(?:the\s+)?(?:microphone|mic)\b', lower):
+        if not LISTENING_ENABLED:
+            set_listening(True)
+            speak("Microphone on")
+        else:
+            speak("Already on")
+        return True
+    if re.search(r'\b(?:microphone|mic)\s+off\b|\bturn\s+off\s+(?:the\s+)?(?:microphone|mic)\b', lower):
+        if LISTENING_ENABLED:
+            set_listening(False)
+            speak("Microphone off")
+        else:
+            speak("Already off")
+        return True
+
+    emit("state", value="thinking")
+    reply = handle_local_tools(command_text)
+    if reply is None:
+        reply = ask_ollama_dual(command_text)
+
+    if reply == "__EXIT__":
+        emit("reply", text="Goodbye sir.")
+        speak("Goodbye sir.")
+        print("\n[Exiting] Assistant shutdown requested by user.")
+        while SPEAKING_IN_PROGRESS:
+            time.sleep(0.05)
+        return False
+
+    if reply.startswith("CHAT_LOG:"):
+        log_content = reply[9:]
+        print("\n" + "=" * 60 + "\nCHAT LOG CONTENTS:\n" + "=" * 60)
+        print(log_content)
+        print("=" * 60 + "\n")
+        emit("reply", text=log_content, kind="log")
+        last_assistant_reply = "Chat log printed."
+        chat_history.append({"role": "user", "content": command_text})
+        chat_history.append({"role": "assistant", "content": last_assistant_reply})
+        log_conversation(command_text, last_assistant_reply)
+        post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
+        followup_window_until = 0.0
+        emit("state", value="idle")
+        return True
+
+    if reply:
+        last_assistant_reply = reply
+        chat_history.append({"role": "user", "content": command_text})
+        chat_history.append({"role": "assistant", "content": reply})
+        log_conversation(command_text, reply)
+        emit("reply", text=reply)
+
+    speak(reply)
+    if piper_voice is None:
+        emit("state", value="idle")
+
+    post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
+    if SHUTDOWN_CONFIRMATION_PENDING:
+        followup_window_until = time.time() + 60.0
+    elif str(reply).rstrip().endswith('?'):
+        followup_window_until = time.time() + 15.0
+    else:
+        followup_window_until = 0.0
+    return True
+
+def _handle_keyboard():
+    """Console hotkeys: space = abort shutdown, M = mic toggle, S = skip speech."""
+    global SHUTDOWN_CONFIRMATION_PENDING, SHUTDOWN_COUNTDOWN_ACTIVE
+    global followup_window_until, post_speak_cooldown_until
+    if not msvcrt.kbhit():
+        return
+    key = msvcrt.getch()
+    if key == b' ':
+        try:
+            res = subprocess.run(["shutdown", "/a"], capture_output=True, text=True)
+            if res.returncode == 0:
+                SHUTDOWN_CONFIRMATION_PENDING = False
+                SHUTDOWN_COUNTDOWN_ACTIVE = False
+                speak("Shutdown Aborted")
+        except Exception as exc:
+            print(f"Error checking spacebar abort: {exc}")
+    elif key in (b'm', b'M'):
+        set_listening(not LISTENING_ENABLED)
+        speak("Microphone on" if LISTENING_ENABLED else "Microphone off")
+    elif key in (b's', b'S'):
+        if stop_speaking():
+            followup_window_until = 0.0
+            post_speak_cooldown_until = time.time() + 0.5
+            print("[TTS] Skip requested.")
+        else:
+            print("[TTS] No speech to skip.")
+
+# -------------------------------------------------------------------
 # Main Continuous Background Loop
 # -------------------------------------------------------------------
-print(f"\n[Ready] System active! Listening for wake word: '{WAKE_WORD}'...")
+def run_loop(stop_event=None, text_queue=None, use_keyboard=False):
+    """Listen forever (or until stop_event is set / user says goodbye)."""
+    global post_speak_cooldown_until
 
-try:
-    frame_count = 0
+    print(f"\n[Ready] System active! Listening for wake word: '{WAKE_WORD}'...")
     last_trigger_time = 0.0
-    followup_window_until = 0.0
-    post_speak_cooldown_until = 0.0
     pre_roll_buffer = deque(maxlen=PRE_ROLL_CHUNKS)
+    was_speaking = False
+    level_tick = 0
 
-    while True:
-        # Spacebar emergency abort
-        if msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key == b' ':
-                try:
-                    res = subprocess.run(["shutdown", "/a"], capture_output=True, text=True)
-                    if res.returncode == 0:
-                        SHUTDOWN_CONFIRMATION_PENDING = False
-                        SHUTDOWN_COUNTDOWN_ACTIVE = False
-                        speak("Shutdown Aborted")
-                except Exception as exc:
-                    print(f"Error checking spacebar abort: {exc}")
+    while stop_event is None or not stop_event.is_set():
+        if use_keyboard:
+            _handle_keyboard()
+
+        # Typed commands from the GUI skip the wake word.
+        if text_queue is not None:
+            try:
+                typed = text_queue.get_nowait()
+            except Exception:
+                typed = None
+            if typed:
+                if not process_command(typed):
+                    break
+                continue
 
         if SPEAKING_IN_PROGRESS:
+            was_speaking = True
             time.sleep(0.05)
             continue
 
         now = time.time()
-
         if now < post_speak_cooldown_until:
             time.sleep(0.05)
             continue
 
-        pcm_data = mic_stream.read(CHUNK, exception_on_overflow=False)
-        audio_frame = np.frombuffer(pcm_data, dtype=np.int16)
-        rms = math.sqrt(np.mean(np.square(audio_frame.astype(np.float32))))
-        frame_count += 1
+        if was_speaking:
+            # Drop audio captured while we were talking so we don't hear ourselves.
+            flush_mic()
+            pre_roll_buffer.clear()
+            was_speaking = False
 
+        pcm_data = mic_stream.read(CHUNK, exception_on_overflow=False)
+        rms = get_rms(pcm_data)
         pre_roll_buffer.append(pcm_data)
 
-        if WAKE_WORD_DEBUG and frame_count % 20 == 0:
-            print(f"[DEBUG] mic_rms={rms:.2f}")
+        level_tick += 1
+        if level_tick % 2 == 0:
+            emit("level", rms=rms, threshold=trigger_threshold())
+        if WAKE_WORD_DEBUG and level_tick % 20 == 0:
+            print(f"[DEBUG] mic_rms={rms:.0f} floor={noise_floor:.0f} trigger={trigger_threshold():.0f}")
 
         if now - last_trigger_time < LISTEN_COOLDOWN_SECONDS:
+            update_noise_floor(rms)
             continue
 
         followup_allowed = (now < followup_window_until) or SHUTDOWN_COUNTDOWN_ACTIVE
 
-        if not followup_allowed and rms < WAKE_WORD_THRESHOLD:
+        if rms < trigger_threshold():
+            update_noise_floor(rms)
             continue
 
-        if not followup_allowed:
-            print(f"\n[!] Speech energy spike detected! RMS={rms:.2f}")
-        else:
-            print("\n[!] Follow-up speech detected.")
+        # Loud enough - make sure it is actually a voice, not a click or bump.
+        if speech_probability(b"".join(list(pre_roll_buffer)[-3:])) < VAD_SPEECH_PROB:
+            continue
 
+        print(f"\n[!] {'Follow-up' if followup_allowed else 'Speech'} detected (RMS={rms:.0f}).")
         last_trigger_time = now
 
         recorded_pcm = record_until_silence(prefix_frames=list(pre_roll_buffer))
+        pre_roll_buffer.clear()
+        if not recorded_pcm:
+            emit("state", value="idle")
+            continue
 
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(audio_interface.get_sample_size(FORMAT))
-            wf.setframerate(RATE)
-            wf.writeframes(recorded_pcm)
-        wav_buffer.seek(0)
-
+        emit("state", value="transcribing")
         print("[+] Transcribing speech to text...")
-        user_text = transcribe_full(wav_buffer)
+        t0 = time.time()
+        user_text = transcribe_full(recorded_pcm)
+        print(f"[+] Transcribed in {time.time() - t0:.2f}s")
 
-        if user_text:
-            print(f"[User Prompt]: {user_text}")
-
-            valid = False
-            if followup_allowed:
-                valid = True
-                command_text = user_text.strip()
-                print("[+] Follow-up mode: accepted command without wake word.")
-            else:
-                # Must contain wake phrase
-                if contains_wake_phrase(user_text):
-                    valid = True
-                    # Pass the full user_text (including numbers) to handle_local_tools
-                    command_text = user_text.strip()
-                else:
-                    print("[-] Heard speech, but no wake phrase detected.")
-                    print(f"\n[Ready] Listening for '{WAKE_WORD}' again...")
-                    continue
-
-            if not valid:
-                continue
-
-            reply = handle_local_tools(command_text)
-            if reply is None:
-                reply = ask_ollama_dual(command_text)
-
-            if reply == "__EXIT__":
-                speak("Goodbye.")
-                print("\n[Exiting] Assistant shutdown requested by user.")
-                break
-
-            # --- Handle chat log (print only, don't speak) ---
-            if reply.startswith("CHAT_LOG:"):
-                log_content = reply[9:]  # strip the prefix
-                print("\n" + "=" * 60)
-                print("CHAT LOG CONTENTS:")
-                print("=" * 60)
-                print(log_content)
-                print("=" * 60 + "\n")
-                # Set last_assistant_reply to a short confirmation
-                last_assistant_reply = "Chat log printed to console."
-                # Log the user command and this confirmation
-                chat_history.append({"role": "user", "content": command_text})
-                chat_history.append({"role": "assistant", "content": last_assistant_reply})
-                log_conversation(command_text, last_assistant_reply)
-                # Do NOT call speak()
-                post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
-                # No follow-up window for this command
-                followup_window_until = 0.0
-            else:
-                # Normal reply – speak it
-                if reply:
-                    last_assistant_reply = reply
-                    chat_history.append({"role": "user", "content": command_text})
-                    chat_history.append({"role": "assistant", "content": reply})
-                    log_conversation(command_text, reply)
-
-                speak(reply)
-
-                post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
-
-                if SHUTDOWN_CONFIRMATION_PENDING:
-                    followup_window_until = time.time() + 60.0
-                elif str(reply).rstrip().endswith('?'):
-                    followup_window_until = time.time() + 15.0
-                else:
-                    followup_window_until = 0.0
-        else:
+        if not user_text:
             print("[-] No clear speech detected.")
+            emit("state", value="idle")
+            continue
+
+        print(f"[User Prompt]: {user_text}")
+        emit("heard", text=user_text)
+
+        if followup_allowed:
+            command_text = strip_wake_word(user_text) if contains_wake_phrase(user_text) else user_text.strip()
+            print("[+] Follow-up mode: accepted command without wake word.")
+        elif contains_wake_phrase(user_text):
+            command_text = strip_wake_word(user_text)
+        else:
+            print("[-] Heard speech, but no wake phrase detected.")
+            emit("state", value="idle")
+            continue
+
+        if not LISTENING_ENABLED and not re.search(r'\b(?:mic|microphone)\b', command_text.lower()):
+            print("[-] Microphone is off. Say 'microphone on' to enable.")
+            emit("state", value="idle")
+            continue
+
+        if not process_command(command_text):
+            break
 
         print(f"\n[Ready] Listening for '{WAKE_WORD}' again...")
 
-except KeyboardInterrupt:
-    print("\n[Exiting] Shutting down background streams...")
-    mic_stream.stop_stream()
-    mic_stream.close()
-    audio_interface.terminate()
-    sys.exit(0)
+    emit("state", value="stopped")
+
+
+if __name__ == "__main__":
+    try:
+        init_engine()
+        run_loop(use_keyboard=True)
+    except KeyboardInterrupt:
+        print("\n[Exiting] Shutting down background streams...")
+    finally:
+        shutdown_engine()

@@ -1,0 +1,13 @@
+faster-whisper>=1.2
+ctranslate2>=4.5
+onnxruntime
+piper-tts>=1.3
+numpy
+scipy
+librosa
+PyAudio
+sounddevice
+requests
+pycaw
+comtypes
+screen-brightness-control

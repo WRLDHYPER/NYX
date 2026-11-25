@@ -1,0 +1,134 @@
+NYX - COMMAND LIST
+==================
+
+HOW TO TALK TO NYX
+------------------
+  * Start with the wake word:  "Nyx, ..."  or  "Hey Nyx, ..."
+    (Nix / Nicks / Knicks also work - Whisper often spells it that way.)
+  * In the app you can also TYPE a command in the box. No wake word needed.
+  * If Nyx asks you a question, you have 15 seconds to answer without
+    saying "Nyx" again.
+  * Anything that is not a command below is sent to the AI chat model
+    (Ollama) as a normal question.
+
+
+VOLUME & BRIGHTNESS
+-------------------
+  "Nyx, set volume to 40"            System volume (0-100)
+  "Nyx, volume 70"
+  "Nyx, set brightness to 60"        Screen brightness (0-100)
+  "Nyx, brightness 30"
+  "Nyx, set speech volume to 50"     How loud Nyx's own voice is (0-100)
+
+
+OPEN APPS & WEBSITES
+--------------------
+  "Nyx, open <app or site>"          also: launch / start / go to / visit
+
+  Apps with shortcuts:
+    notepad, calculator (calc), paint, word, excel, powerpoint, outlook,
+    file explorer (explorer), command prompt (cmd), powershell, terminal,
+    snipping tool, task manager, control panel, settings, chrome, firefox,
+    edge, browser, spotify, discord, slack, steam,
+    visual studio code (vscode)
+  Any other installed app: Nyx searches the Start Menu, Desktop and
+  Program Files for it, e.g. "Nyx, open OBS".
+
+  Websites with shortcuts:
+    google, youtube, github, gmail, docs, roblox, netflix, discord,
+    twitter / x, facebook, instagram, duckduckgo, reddit, spotify, steam,
+    minecraft, gemini, aternos, microsoft
+  Any other site: "Nyx, open example.com" or "Nyx, open https://..."
+  A single word like "Nyx, open twitch" tries www.twitch.com.
+
+
+TIME & DATE
+-----------
+  "Nyx, what time is it?"
+  "Nyx, what's the date today?"
+  "Nyx, what day is it?"
+
+
+FILES & CHAT HISTORY
+--------------------
+  "Nyx, read file C:\Users\...\notes.txt"
+        Reads the first part of a text file. Only works for files in:
+        Documents, Desktop, the NYX folder and the folder Nyx was started from.
+  "Nyx, read chat log"               Shows the last 10 conversations
+  "Nyx, show previous chats"         (same)
+  "Nyx, read full chat log"          Shows the whole chat history
+  "Nyx, repeat that"                 Repeats Nyx's last answer
+        also: "say that again", "what did you say", "repeat"
+
+
+THINKING MODES
+--------------
+  "Nyx, deep mode"                   Use the smarter (slower) AI model
+        also: "think", "deep", "smart model"
+  "Nyx, normal mode"                 Back to the fast AI model
+        also: "standard", "regular"
+
+
+MICROPHONE
+----------
+  "Nyx, mic off"  /  "Nyx, turn off the microphone"
+  "Nyx, mic on"   /  "Nyx, turn on the microphone"
+        While the mic is off, Nyx only reacts to "Nyx, mic on".
+
+
+MINIMIZE / RESTORE
+------------------
+  "Nyx, minimize"                    Hides the app (Nyx keeps listening)
+        also: "hide yourself", "hide the app", "hide the window"
+  "Nyx, come back"                   Brings the app back fullscreen
+        also: "restore", "maximize", "show yourself", "full screen"
+  In the console version these minimize / restore the console window.
+
+
+SHUTTING DOWN THE PC
+--------------------
+  "Nyx, shutdown system"             Nyx asks for confirmation
+  "confirm"  (or "yes")              PC shuts down in 20 seconds
+                                     (a big flashing red countdown box
+                                     appears in the app)
+  "abort"    (or "cancel", "override", "no")
+                                     Cancels the shutdown (a blue
+                                     "SHUTDOWN ABORTED" box appears).
+                                     In the app you can also click ABORT
+                                     or press Space.
+
+
+CLOSING NYX
+-----------
+  "Nyx, goodbye"
+        also: "bye", "exit", "quit", "close yourself", "close the app"
+
+
+KEYBOARD SHORTCUTS
+------------------
+  In the app (run_app.bat):
+    Ctrl+M     Mic on / off
+    Esc        Stop Nyx talking
+    Ctrl+L     Clear the conversation
+    F11        Fullscreen on / off (the app starts fullscreen)
+    Ctrl+H     Minimize
+    Space      Abort a shutdown (while the countdown is showing)
+    Alt+F4     Close the app
+    Enter      Send the typed command
+
+  In the console version (run_assistant.bat):
+    M          Mic on / off
+    S          Stop Nyx talking
+    Space      Cancel a pending PC shutdown
+
+
+GOOD TO KNOW
+------------
+  * Any sentence containing "think" or "deep" switches to deep mode,
+    and "normal" / "standard" / "regular" switches back.
+  * Any sentence containing "time", "date", "day", "today" or "clock"
+    gets the time as an answer.
+  * Any sentence containing "volume" or "brightness" is treated as a
+    volume/brightness command.
+  * Any sentence containing "bye", "exit" or "quit" closes Nyx.
+  * Say "shutdown" as one word for the PC shutdown command.
