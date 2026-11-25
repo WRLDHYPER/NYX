@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import re
 import wave
 import sys
@@ -828,30 +829,33 @@ def safe_read_file(command_text):
     except Exception as exc:
         return f"I can't read that file because of an error: {exc}"
 
+SITE_ALIASES = {
+    "google": "https://www.google.com",
+    "youtube": "https://www.youtube.com",
+    "github": "https://github.com",
+    "gmail": "https://mail.google.com",
+    "docs": "https://docs.google.com",
+    "roblox": "https://www.roblox.com",
+    "netflix": "https://www.netflix.com",
+    "discord": "https://discord.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "facebook": "https://www.facebook.com",
+    "instagram": "https://www.instagram.com",
+    "duckduckgo": "https://duckduckgo.com",
+    "reddit": "https://www.reddit.com",
+    "spotify": "https://open.spotify.com",
+    "steam": "https://store.steampowered.com",
+    "minecraft": "https://www.minecraft.net",
+    "gemini": "https://gemini.google.com/app",
+    "aternos": "https://www.aternos.org/en",
+    "microsoft": "https://www.microsoft.com",
+}
+
 def safe_open_link(command_text):
     text = (command_text or "").strip()
     lower_text = text.lower()
-    site_aliases = {
-        "google": "https://www.google.com",
-        "youtube": "https://www.youtube.com",
-        "github": "https://github.com",
-        "gmail": "https://mail.google.com",
-        "docs": "https://docs.google.com",
-        "roblox": "https://www.roblox.com",
-        "netflix": "https://www.netflix.com",
-        "discord": "https://discord.com",
-        "twitter": "https://x.com",
-        "x": "https://x.com",
-        "facebook": "https://www.facebook.com",
-        "instagram": "https://www.instagram.com",
-        "duckduckgo": "https://duckduckgo.com",
-        "reddit": "https://www.reddit.com",
-        "spotify": "https://open.spotify.com",
-        "steam": "https://store.steampowered.com",
-        "minecraft": "https://www.minecraft.net",
-        "gemini": "https://gemini.google.com/app",
-        "aternos": "https://www.aternos.org/en",
-    }
+    site_aliases = SITE_ALIASES
     parsed_url = None
     url_match = re.search(r'https?://[^\s]+', text, flags=re.IGNORECASE)
     if url_match:
@@ -877,16 +881,7 @@ def safe_open_link(command_text):
 def quick_open_from_text(command_text):
     text = (command_text or "").strip()
     lower_text = text.lower()
-    site_aliases = {
-        "google": "https://www.google.com",
-        "youtube": "https://www.youtube.com",
-        "github": "https://github.com",
-        "roblox": "https://www.roblox.com",
-        "microsoft": "https://www.microsoft.com",
-        "gmail": "https://mail.google.com",
-        "gemini": "https://gemini.google.com/app",
-        "aternos": "https://www.aternos.org/en",
-    }
+    site_aliases = SITE_ALIASES
     for name, url in site_aliases.items():
         if re.search(rf'\b{name}\b', lower_text):
             try:
@@ -906,189 +901,187 @@ def quick_open_from_text(command_text):
     return None
 
 # -------------------------------------------------------------------
-# Enhanced Application Opener
+# Application opener
+# Installed apps are indexed once in the background at start-up, so
+# "open discord" is a dictionary lookup instead of a disk scan.
 # -------------------------------------------------------------------
-def open_application(command_text):
-    print(f"[DEBUG] open_application called with: '{command_text}'")
+APP_ALIASES = {
+    "notepad": "notepad.exe",
+    "calc": "calc.exe",
+    "calculator": "calc.exe",
+    "paint": "mspaint.exe",
+    "explorer": "explorer.exe",
+    "file explorer": "explorer.exe",
+    "files": "explorer.exe",
+    "cmd": "cmd.exe",
+    "command prompt": "cmd.exe",
+    "powershell": "powershell.exe",
+    "terminal": "wt.exe",
+    "snipping tool": "snippingtool.exe",
+    "task manager": "taskmgr.exe",
+    "control panel": "control.exe",
+    "settings": "ms-settings:",
+    "browser": "msedge.exe",
+    "edge": "msedge.exe",
+    "vscode": "code.exe",
+    "vs code": "code.exe",
+}
 
+_APP_INDEX = {}                       # lowercase name -> launch target
+_APP_INDEX_LOCK = threading.Lock()
+_APP_INDEX_READY = threading.Event()
+_APP_INDEX_BUILDING = threading.Event()
+_APP_JUNK_WORDS = ("uninstall", "uninst", "setup", "installer", "update", "helper",
+                   "crashpad", "crash reporter", "readme", "license", "release notes")
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _walk_limited(base, exts, max_depth):
+    """Yield files ending in exts, never descending deeper than max_depth."""
+    base = os.path.normpath(base)
+    base_depth = base.count(os.sep)
+    for root, dirs, files in os.walk(base):
+        if root.count(os.sep) - base_depth >= max_depth:
+            dirs[:] = []  # prune here so os.walk doesn't visit the subtree
+        for f in files:
+            if f.lower().endswith(exts):
+                yield os.path.join(root, f)
+
+
+def _is_junk_app(name):
+    n = name.lower()
+    return any(w in n for w in _APP_JUNK_WORDS)
+
+
+def build_app_index():
+    """Scan Start Menu, Desktop, Store apps and Program Files once."""
+    _APP_INDEX_BUILDING.set()
+    started = time.time()
+    env = os.environ.get
+    index = {}
+    try:
+        # Lowest priority first: bare .exe files (only first match per name kept).
+        for base in (env("ProgramFiles", r"C:\Program Files"),
+                     env("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     os.path.join(env("LOCALAPPDATA", ""), "Programs")):
+            if base and os.path.isdir(base):
+                for path in _walk_limited(base, (".exe",), 3):
+                    name = os.path.splitext(os.path.basename(path))[0]
+                    if not _is_junk_app(name):
+                        index.setdefault(name.lower(), path)
+
+        # Everything in the Start menu, including Microsoft Store apps.
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }"],
+                capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW,
+            ).stdout
+            for line in out.splitlines():
+                name, _, app_id = line.partition("|")
+                name, app_id = name.strip(), app_id.strip()
+                if name and app_id and not _is_junk_app(name):
+                    index[name.lower()] = "shell:AppsFolder\\" + app_id
+        except Exception as exc:
+            print(f"[apps] Get-StartApps failed: {exc}")
+
+        # Highest priority: real shortcuts (Start Menu + Desktop).
+        for base in (os.path.join(env("ProgramData", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+                     os.path.join(env("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+                     os.path.join(env("USERPROFILE", ""), "Desktop"),
+                     os.path.join(env("PUBLIC", ""), "Desktop")):
+            if base and os.path.isdir(base):
+                for path in _walk_limited(base, (".lnk", ".url"), 3):
+                    name = os.path.splitext(os.path.basename(path))[0]
+                    if not _is_junk_app(name):
+                        index[name.lower()] = path
+    finally:
+        with _APP_INDEX_LOCK:
+            _APP_INDEX.clear()
+            _APP_INDEX.update(index)
+        _APP_INDEX_READY.set()
+        _APP_INDEX_BUILDING.clear()
+        print(f"[apps] Indexed {len(index)} applications in {time.time() - started:.1f}s.")
+
+
+def refresh_app_index():
+    """Rebuild the index in the background (picks up newly installed apps)."""
+    if not _APP_INDEX_BUILDING.is_set():
+        threading.Thread(target=build_app_index, daemon=True).start()
+
+
+def _find_app(app_name, exact_only=False):
+    key = app_name.lower().strip()
+    with _APP_INDEX_LOCK:
+        if key in _APP_INDEX:
+            return _APP_INDEX[key]
+        if exact_only:
+            return None
+        items = list(_APP_INDEX.items())
+    tests = [lambda n: n.startswith(key),
+             lambda n: re.search(rf"\b{re.escape(key)}\b", n)]
+    if len(key) >= 3:
+        tests.append(lambda n: key in n)
+    for test in tests:
+        hits = [(n, p) for n, p in items if test(n)]
+        if hits:
+            return min(hits, key=lambda h: len(h[0]))[1]  # shortest name = best match
+    close = difflib.get_close_matches(key, [n for n, _ in items], n=1, cutoff=0.85)
+    if close:
+        with _APP_INDEX_LOCK:
+            return _APP_INDEX.get(close[0])
+    return None
+
+
+def _launch_target(target):
+    try:
+        if target.lower().startswith("shell:appsfolder"):
+            subprocess.Popen(["explorer.exe", target], creationflags=_NO_WINDOW)
+        elif target.lower().endswith(".exe") and os.path.isabs(target):
+            os.startfile(target, cwd=os.path.dirname(target))
+        else:
+            os.startfile(target)
+        return True
+    except Exception as exc:
+        print(f"[apps] Failed to launch {target}: {exc}")
+        return False
+
+
+def open_application(command_text):
     match = re.search(r'\b(?:open|launch|start)\s+(.+?)(?:\s+app)?\s*$', command_text, re.IGNORECASE)
     if not match:
-        print("[DEBUG] No app name found in command.")
         return None
-    app_name = match.group(1).strip()
-    if not app_name:
-        print("[DEBUG] App name is empty.")
+    app_name = re.sub(r'[.,!?;:]+$', '', match.group(1)).strip()
+    app_name = re.sub(r'\s*\bapp$', '', app_name, flags=re.IGNORECASE).strip()
+    if not app_name or '://' in app_name or app_name.lower().startswith('http'):
         return None
+    key = app_name.lower()
 
-    if app_name.lower().endswith(" app"):
-        app_name = app_name[:-4].strip()
-    elif app_name.lower().endswith("app"):
-        app_name = app_name[:-3].strip()
-
-    app_name = re.sub(r'[.,!?;:]+$', '', app_name).strip()
-    print(f"[DEBUG] Cleaned app name: '{app_name}'")
-
-    if '://' in app_name or app_name.lower().startswith('http'):
-        print("[DEBUG] Looks like a URL, skipping app search.")
-        return None
-
-    ALIASES = {
-        "notepad": "notepad.exe",
-        "calc": "calc.exe",
-        "calculator": "calc.exe",
-        "paint": "mspaint.exe",
-        "word": "winword.exe",
-        "excel": "excel.exe",
-        "powerpoint": "powerpnt.exe",
-        "outlook": "outlook.exe",
-        "explorer": "explorer.exe",
-        "file explorer": "explorer.exe",
-        "cmd": "cmd.exe",
-        "command prompt": "cmd.exe",
-        "powershell": "powershell.exe",
-        "terminal": "wt.exe",
-        "snipping tool": "snippingtool.exe",
-        "task manager": "taskmgr.exe",
-        "control panel": "control.exe",
-        "settings": "ms-settings:",
-        "chrome": "chrome.exe",
-        "firefox": "firefox.exe",
-        "edge": "msedge.exe",
-        "browser": "msedge.exe",
-        "spotify": "spotify.exe",
-        "discord": "Discord.exe",
-        "slack": "slack.exe",
-        "steam": "steam.exe",
-        "vscode": "code.exe",
-        "visual studio code": "code.exe",
-    }
-
-    if app_name.lower() in ALIASES:
-        exe_name = ALIASES[app_name.lower()]
-        exe_path = shutil.which(exe_name)
-        if exe_path:
-            print(f"[DEBUG] Found alias '{app_name}' -> '{exe_name}' at {exe_path}")
-            try:
-                subprocess.Popen(
-                    [exe_path],
-                    creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL
-                )
-                return f"Opening {app_name}."
-            except Exception as e:
-                print(f"[DEBUG] Failed to launch alias: {e}")
-        else:
-            print(f"[DEBUG] Alias '{app_name}' not found in PATH, continuing search.")
-
-    def launch_exe(path):
-        try:
-            subprocess.Popen(
-                [path],
-                creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
-            )
-            return True
-        except Exception as e:
-            print(f"[DEBUG] launch_exe failed: {e}")
-            return False
-
-    def launch_shortcut(path):
-        try:
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", path],
-                shell=False,
-                creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
-            )
-            return True
-        except Exception as e:
-            print(f"[DEBUG] launch_shortcut failed: {e}")
-            return False
-
-    exe_path = shutil.which(app_name)
-    if not exe_path and not app_name.lower().endswith('.exe'):
-        exe_path = shutil.which(app_name + '.exe')
-    if exe_path:
-        print(f"[DEBUG] Found in PATH: {exe_path}")
-        if launch_exe(exe_path):
+    # 1. Built-in Windows tools.
+    alias = APP_ALIASES.get(key)
+    if alias:
+        target = alias if alias.endswith(":") else shutil.which(alias)
+        if target and _launch_target(target):
             return f"Opening {app_name}."
 
-    search_dirs = [
-        os.path.join(os.environ.get("ProgramData", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
-        os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
-        os.environ.get("ProgramFiles", "C:\\Program Files"),
-        os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-        os.path.join(os.environ.get("APPDATA", ""), "Programs"),
-        os.path.join(os.environ.get("USERPROFILE", ""), "Desktop"),
-        os.path.join(os.environ.get("PUBLIC", ""), "Desktop"),
-        os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32"),
-        os.path.join(os.environ.get("SystemRoot", "C:\\Windows")),
-        r"C:\Program Files\WindowsApps",
-        os.path.join(os.environ.get("SystemDrive", "C:"), "Program Files\\Common Files"),
-        os.path.join(os.environ.get("SystemDrive", "C:"), "Program Files (x86)\\Common Files"),
-    ]
+    # 2. Installed apps (index is normally ready long before the first command).
+    if not _APP_INDEX_READY.is_set():
+        if not _APP_INDEX_BUILDING.is_set():
+            refresh_app_index()
+        _APP_INDEX_READY.wait(timeout=30)
+    # Names that are also websites ("google", "youtube") only open an app on an
+    # exact match, so "open google" doesn't launch Google Chrome.
+    target = _find_app(app_name, exact_only=key in SITE_ALIASES)
+    if target and _launch_target(target):
+        return f"Opening {app_name}."
 
-    for base_dir in search_dirs:
-        if not base_dir or not os.path.isdir(base_dir):
-            continue
-        print(f"[DEBUG] Searching in: {base_dir}")
-        try:
-            for root, dirs, files in os.walk(base_dir):
-                depth = root.replace(base_dir, '').count(os.sep)
-                if depth > 4:
-                    continue
-                for file in files:
-                    file_lower = file.lower()
-                    if file_lower.endswith(".lnk"):
-                        name_no_ext = os.path.splitext(file)[0]
-                        if app_name.lower() in name_no_ext.lower():
-                            shortcut_path = os.path.join(root, file)
-                            print(f"[DEBUG] Found shortcut: {shortcut_path}")
-                            if launch_shortcut(shortcut_path):
-                                return f"Opening {app_name}."
-                    elif file_lower.endswith(".exe"):
-                        name_no_ext = os.path.splitext(file)[0]
-                        if app_name.lower() in name_no_ext.lower():
-                            exe_full = os.path.join(root, file)
-                            print(f"[DEBUG] Found exe: {exe_full}")
-                            if launch_exe(exe_full):
-                                return f"Opening {app_name}."
-        except Exception as e:
-            print(f"[DEBUG] Error scanning {base_dir}: {e}")
-            continue
+    # 3. Anything on PATH.
+    target = shutil.which(app_name) or shutil.which(app_name + ".exe")
+    if target and _launch_target(target):
+        return f"Opening {app_name}."
 
-    root_search = [
-        os.environ.get("ProgramFiles", "C:\\Program Files"),
-        os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-    ]
-    for root_dir in root_search:
-        if not root_dir or not os.path.isdir(root_dir):
-            continue
-        print(f"[DEBUG] Scanning Program Files root: {root_dir}")
-        try:
-            for item in os.listdir(root_dir):
-                item_path = os.path.join(root_dir, item)
-                if os.path.isdir(item_path):
-                    for f in os.listdir(item_path):
-                        if f.lower().endswith(".exe"):
-                            name_no_ext = os.path.splitext(f)[0]
-                            if app_name.lower() in name_no_ext.lower():
-                                exe_full = os.path.join(item_path, f)
-                                print(f"[DEBUG] Found exe: {exe_full}")
-                                if launch_exe(exe_full):
-                                    return f"Opening {app_name}."
-        except Exception as e:
-            print(f"[DEBUG] Error scanning {root_dir}: {e}")
-            continue
-
-    print(f"[DEBUG] No application found for: {app_name}")
+    if key not in SITE_ALIASES:
+        refresh_app_index()  # maybe it was installed after start-up
     return None
 
 # -------------------------------------------------------------------
@@ -1273,6 +1266,25 @@ def handle_local_tools(command_text):
 
     return None
 
+def _ollama_generate(url, payload):
+    """Stream a reply from Ollama, giving up as soon as "end task" is requested.
+    Closing the connection also makes Ollama stop generating."""
+    payload = dict(payload, stream=True)
+    with requests.post(url, json=payload, timeout=90, stream=True) as response:
+        if response.status_code != 200:
+            return f"Ollama HTTP Error: {response.status_code}"
+        parts = []
+        for line in response.iter_lines():
+            if CANCEL_THINKING.is_set():
+                return ""
+            if not line:
+                continue
+            chunk = json.loads(line)
+            parts.append(chunk.get("response", ""))
+            if chunk.get("done"):
+                break
+        return "".join(parts).strip()
+
 def ask_ollama_dual(prompt):
     url = "http://localhost:11434/api/generate"
     lowered = normalize_transcript(prompt or "")
@@ -1299,11 +1311,7 @@ def ask_ollama_dual(prompt):
         "stream": False
     }
     try:
-        response = requests.post(url, json=payload, timeout=90)
-        if response.status_code == 200:
-            return response.json().get("response", "").strip()
-        else:
-            return f"Ollama HTTP Error: {response.status_code}"
+        return _ollama_generate(url, payload)
     except Exception as err:
         if selected_model == SMART_MODEL:
             try:
@@ -1313,9 +1321,9 @@ def ask_ollama_dual(prompt):
                     "system": system_instructions,
                     "stream": False,
                 }
-                fallback_response = requests.post(url, json=fallback_payload, timeout=90)
-                if fallback_response.status_code == 200:
-                    return fallback_response.json().get("response", "").strip()
+                fallback_reply = _ollama_generate(url, fallback_payload)
+                if not fallback_reply.startswith("Ollama HTTP Error"):
+                    return fallback_reply
             except Exception:
                 pass
         return f"Error connecting to Ollama backend: {err}"
@@ -1330,6 +1338,7 @@ def init_engine(greet=True):
     global ENGINE_READY
     if ENGINE_READY:
         return
+    refresh_app_index()  # index installed apps in the background
     emit("state", value="loading", detail="Loading voice")
     load_piper()
     emit("state", value="loading", detail="Loading speech recognition")
@@ -1365,6 +1374,69 @@ def set_listening(enabled):
     LISTENING_ENABLED = bool(enabled)
     emit("mic", enabled=LISTENING_ENABLED)
 
+# -------------------------------------------------------------------
+# "End task": interrupt Nyx while it is thinking
+# -------------------------------------------------------------------
+CANCEL_THINKING = threading.Event()
+THINKING_IN_PROGRESS = False
+USE_KEYBOARD = False
+END_TASK_RE = re.compile(
+    r"\b(?:end|stop|cancel|abort|kill)\s+(?:the\s+|this\s+|that\s+)?(?:task|thinking|request|question)\b"
+    r"|\bstop\s+thinking\b|\bcancel\s+(?:that|it)\b|\bnever\s*mind\b|\bforget\s+it\b",
+    re.IGNORECASE,
+)
+
+def is_end_task(text):
+    return bool(END_TASK_RE.search(text or ""))
+
+def cancel_thinking():
+    """Stop the question Nyx is working on. Returns True if there was one."""
+    if THINKING_IN_PROGRESS:
+        CANCEL_THINKING.set()
+        print("[!] End task requested.")
+        return True
+    return False
+
+def _poll_for_cancel():
+    """While thinking: watch the console key E/Esc and listen for "end task"."""
+    if USE_KEYBOARD and msvcrt.kbhit():
+        if msvcrt.getch() in (b"e", b"E", b"\x1b"):
+            cancel_thinking()
+        return
+    if not LISTENING_ENABLED or mic_stream is None:
+        time.sleep(0.05)
+        return
+    pcm = mic_stream.read(CHUNK, exception_on_overflow=False)  # also paces the loop
+    rms = get_rms(pcm)
+    if rms < trigger_threshold() or speech_probability(pcm) < VAD_SPEECH_PROB:
+        return
+    recorded = record_until_silence(prefix_frames=[pcm])
+    if THINKING_IN_PROGRESS and not CANCEL_THINKING.is_set():
+        emit("state", value="thinking")
+    if not recorded or not THINKING_IN_PROGRESS:
+        return
+    heard = transcribe_full(recorded)
+    print(f"[While thinking] Heard: {heard}")
+    if is_end_task(heard):
+        cancel_thinking()
+
+def think_cancellable(prompt):
+    """Ask Ollama in the background. Returns None if the user ended the task."""
+    global THINKING_IN_PROGRESS
+    CANCEL_THINKING.clear()
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(reply=ask_ollama_dual(prompt)), daemon=True)
+    THINKING_IN_PROGRESS = True
+    worker.start()
+    try:
+        while worker.is_alive() and not CANCEL_THINKING.is_set():
+            _poll_for_cancel()
+    finally:
+        THINKING_IN_PROGRESS = False
+    if CANCEL_THINKING.is_set():
+        return None
+    return result.get("reply", "")
+
 def process_command(command_text):
     """Run one command. Returns False if the assistant should exit."""
     global last_assistant_reply, followup_window_until, post_speak_cooldown_until
@@ -1390,10 +1462,31 @@ def process_command(command_text):
             speak("Already off")
         return True
 
+    if is_end_task(command_text):
+        # Nothing is thinking right now (a running task is cancelled before it
+        # gets here), so just stop talking if Nyx is mid-sentence.
+        reply = "Stopped." if stop_speaking() else "There's nothing running to stop."
+        emit("reply", text=reply)
+        if reply != "Stopped.":
+            speak(reply)
+        emit("state", value="idle")
+        post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
+        followup_window_until = 0.0
+        return True
+
     emit("state", value="thinking")
     reply = handle_local_tools(command_text)
     if reply is None:
-        reply = ask_ollama_dual(command_text)
+        reply = think_cancellable(command_text)
+        if reply is None:
+            print("[!] Task ended by user.")
+            emit("reply", text="Task ended.")
+            speak("Okay, stopped.")
+            if piper_voice is None:
+                emit("state", value="idle")
+            post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
+            followup_window_until = 0.0
+            return True
 
     if reply == "__EXIT__":
         emit("reply", text="Goodbye sir.")
@@ -1439,7 +1532,8 @@ def process_command(command_text):
     return True
 
 def _handle_keyboard():
-    """Console hotkeys: space = abort shutdown, M = mic toggle, S = skip speech."""
+    """Console hotkeys: space = abort shutdown, M = mic toggle, S = skip speech.
+    (E or Esc ends a task while Nyx is thinking - see _poll_for_cancel.)"""
     global SHUTDOWN_CONFIRMATION_PENDING, SHUTDOWN_COUNTDOWN_ACTIVE
     global followup_window_until, post_speak_cooldown_until
     if not msvcrt.kbhit():
@@ -1470,7 +1564,8 @@ def _handle_keyboard():
 # -------------------------------------------------------------------
 def run_loop(stop_event=None, text_queue=None, use_keyboard=False):
     """Listen forever (or until stop_event is set / user says goodbye)."""
-    global post_speak_cooldown_until
+    global post_speak_cooldown_until, USE_KEYBOARD
+    USE_KEYBOARD = use_keyboard
 
     print(f"\n[Ready] System active! Listening for wake word: '{WAKE_WORD}'...")
     last_trigger_time = 0.0

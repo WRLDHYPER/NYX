@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-py -3.11 "%~dp0nyx_app.py"
-if errorlevel 1 pause
+rem pyw = Python without a console window. Errors go to nyx_app.log.
+start "" pyw -3.11 "%~dp0nyx_app.py"

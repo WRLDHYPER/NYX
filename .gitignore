@@ -4,3 +4,4 @@ voices/
 manifests/
 *.onnx
 *.jsonprevious_chats.txt
+nyx_app.log

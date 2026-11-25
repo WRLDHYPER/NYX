@@ -6,11 +6,21 @@ Runs the engine from assistant.py on a background thread and shows:
   * a live mic level meter with the adaptive trigger level
   * the conversation, plus a box to type commands without the wake word
 
-Shortcuts:  Ctrl+M  mic on/off     Esc  stop speaking     Ctrl+L  clear chat
+Shortcuts:  Ctrl+M  mic on/off     Esc  stop speaking / end task     Ctrl+L  clear chat
             F11     fullscreen on/off     Ctrl+H  minimize
 """
 import math
 import os
+import sys
+
+# Launched with pythonw (no console window): stdout/stderr are None, and any
+# library that writes to them would crash. Send that output to a log instead.
+if sys.stdout is None or sys.stderr is None:
+    _log = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nyx_app.log"),
+                "w", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stdout or _log
+    sys.stderr = sys.stderr or _log
+
 import queue
 import threading
 import time
@@ -35,7 +45,7 @@ STATE_STYLE = {
     "idle":         ("#38bdf8", "Standing by",    'Say "Nyx" to wake me'),
     "listening":    ("#22d3ee", "Listening",      "Go ahead, I'm listening"),
     "transcribing": ("#fbbf24", "Understanding",  "Turning speech into text"),
-    "thinking":     ("#a78bfa", "Thinking",       "Working on it"),
+    "thinking":     ("#a78bfa", "Thinking",       'Say "end task" or press Esc to stop'),
     "speaking":     ("#34d399", "Speaking",       "Esc to interrupt"),
     "muted":        ("#64748b", "Mic muted",      "Ctrl+M or say \"Nyx, mic on\""),
     "stopped":      ("#5b6680", "Offline",        "Engine stopped"),
@@ -698,6 +708,9 @@ class NyxApp:
         if self.engine is None or not self.engine.ENGINE_READY:
             self._system("Still starting up — try again in a moment.")
             return
+        # The engine is busy while thinking, so "end task" can't wait in the queue.
+        if self.engine.is_end_task(text) and self.engine.cancel_thinking():
+            return
         self.commands.put(text)
 
     def toggle_mic(self):
@@ -706,8 +719,10 @@ class NyxApp:
         self.engine.set_listening(not self.engine.LISTENING_ENABLED)
 
     def skip_speech(self):
+        """Esc: stop talking, or end the task if Nyx is still thinking."""
         if self.engine is not None:
-            self.engine.stop_speaking()
+            if not self.engine.cancel_thinking():
+                self.engine.stop_speaking()
 
     def on_close(self):
         self.stop_event.set()

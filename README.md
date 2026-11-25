@@ -148,7 +148,8 @@ The first start takes a little while (loading the models). When Nyx says
 | App | Console |
 |---|---|
 | **Ctrl+M** mic on/off | **M** mic on/off |
-| **Esc** stop Nyx talking | **S** stop Nyx talking |
+| **Esc** stop Nyx talking / end task | **S** stop Nyx talking |
+| | **E** or **Esc** end task while thinking |
 | **Ctrl+H** minimize | **Space** cancel a shutdown |
 | **F11** fullscreen on/off | |
 | **Ctrl+L** clear chat | |

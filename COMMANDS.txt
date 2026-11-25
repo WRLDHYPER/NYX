@@ -67,6 +67,10 @@ THINKING MODES
         also: "think", "deep", "smart model"
   "Nyx, normal mode"                 Back to the fast AI model
         also: "standard", "regular"
+  "end task"                         Stops Nyx while it's still thinking
+        also: "stop thinking", "cancel that", "never mind", "forget it"
+        No "Nyx" needed while it's thinking. You can also type it,
+        press Esc in the app, or press E in the console version.
 
 
 MICROPHONE
@@ -108,7 +112,7 @@ KEYBOARD SHORTCUTS
 ------------------
   In the app (run_app.bat):
     Ctrl+M     Mic on / off
-    Esc        Stop Nyx talking
+    Esc        Stop Nyx talking / end task while thinking
     Ctrl+L     Clear the conversation
     F11        Fullscreen on / off (the app starts fullscreen)
     Ctrl+H     Minimize
@@ -119,6 +123,7 @@ KEYBOARD SHORTCUTS
   In the console version (run_assistant.bat):
     M          Mic on / off
     S          Stop Nyx talking
+    E  or Esc  End task while Nyx is thinking
     Space      Cancel a pending PC shutdown
 
 
