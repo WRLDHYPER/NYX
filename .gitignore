@@ -3,4 +3,4 @@ blobs/
 voices/
 manifests/
 *.onnx
-*.json
+*.jsonprevious_chats.txt
