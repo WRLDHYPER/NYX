@@ -18,6 +18,18 @@ from collections import deque
 
 import difflib
 
+# setup.exe installs the CUDA libraries (cuBLAS/cuDNN) as pip packages. Windows
+# doesn't look inside site-packages for DLLs, so add their folders before
+# faster-whisper/ctranslate2 tries to load them.
+if sys.platform == "win32":
+    import site
+    for _sp in site.getsitepackages():
+        _nv = Path(_sp) / "nvidia"
+        if _nv.is_dir():
+            for _bin in _nv.glob("*/bin"):
+                os.add_dll_directory(str(_bin))
+                os.environ["PATH"] = str(_bin) + os.pathsep + os.environ.get("PATH", "")
+
 import numpy as np
 import librosa
 import pyaudio
@@ -38,12 +50,13 @@ except Exception:
 # -------------------------------------------------------------------
 EVENT_SINK = None
 
-def emit(kind, **data):
-    """Send an event to the GUI (if attached). Never raises."""
+def emit(event_type, /, **data):
+    """Send an event to the GUI (if attached). Never raises.
+    event_type is positional-only so events can carry their own 'kind' field."""
     if EVENT_SINK is None:
         return
     try:
-        EVENT_SINK({"type": kind, **data})
+        EVENT_SINK({"type": event_type, **data})
     except Exception:
         pass
 
@@ -78,6 +91,8 @@ else:
 # Configuration Options
 # -------------------------------------------------------------------
 FAST_MODEL = "dolphin-llama3:8b"
+# Used for deep mode and long questions, but only if it is installed in Ollama
+# (setup.bat asks whether to download it). If not, FAST_MODEL answers everything.
 SMART_MODEL = "qwen2.5:14b"
 SMART_MODEL_TRIGGERS = [
     "deep think", "think deeply", "deep reasoning", "reason step by step",
@@ -143,12 +158,18 @@ WAKE_ALIASES = {
 }
 
 SHUTDOWN_CONFIRMATION_PENDING = False
+PENDING_LEVEL = None   # "volume"/"brightness" after Nyx asks "what level?"
 SHUTDOWN_COUNTDOWN_ACTIVE = False
 SPEAKING_IN_PROGRESS = False
 POST_SPEAK_COOLDOWN = 0.3
 LISTENING_ENABLED = True
 STOP_TTS = False
-SPEECH_VOLUME = 100  # 0-100, controls TTS gain
+import nyx_settings
+_settings = nyx_settings.load()
+SPEECH_VOLUME = int(_settings["speech_volume"])  # 0-100, controls TTS gain
+CHAT_LOG_ENABLED = bool(_settings["chat_log_enabled"])
+DELETE_LOG_CONFIRMATION_PENDING = False
+_SKIP_LOG_ONCE = False   # don't write the "chat log deleted" exchange into the new log
 
 # -------------------------------------------------------------------
 # Chat History & Logging
@@ -164,11 +185,42 @@ CHAT_LOG_FILE = SCRIPT_DIR / "previous_chats.txt"
 
 def log_conversation(user_text, assistant_reply):
     """Append user & assistant messages to the log file with timestamp."""
+    global _SKIP_LOG_ONCE
+    if _SKIP_LOG_ONCE:
+        _SKIP_LOG_ONCE = False
+        return
+    if not CHAT_LOG_ENABLED:
+        return
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(CHAT_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] User: {user_text}\n")
         f.write(f"[{timestamp}] Nyx: {assistant_reply}\n")
         f.write("-" * 40 + "\n")
+
+def delete_chat_log(skip_next_log=True):
+    """Delete previous_chats.txt and forget the conversation. Returns a message.
+    skip_next_log: don't log the exchange that asked for it (voice command),
+    so the deleted log doesn't come straight back."""
+    global _SKIP_LOG_ONCE
+    try:
+        CHAT_LOG_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        return f"Could not delete the chat history: {e}"
+    chat_history.clear()
+    _SKIP_LOG_ONCE = skip_next_log
+    emit("chat_deleted")
+    return "Chat history deleted."
+
+def set_chat_log_enabled(enabled):
+    """Turn saving to previous_chats.txt on or off (remembered in settings.json)."""
+    global CHAT_LOG_ENABLED
+    CHAT_LOG_ENABLED = bool(enabled)
+    try:
+        nyx_settings.update(chat_log_enabled=CHAT_LOG_ENABLED)
+    except Exception as e:
+        print(f"[-] Could not save settings: {e}")
+    emit("settings_changed")
+    return "Chat log turned on." if CHAT_LOG_ENABLED else "Chat log turned off. I won't save our conversations."
 
 def read_chat_log(full=False):
     if not CHAT_LOG_FILE.exists():
@@ -301,6 +353,11 @@ def set_speech_volume(level):
     if level < 0 or level > 100:
         return "Speech volume must be between 0 and 100."
     SPEECH_VOLUME = level
+    try:
+        nyx_settings.update(speech_volume=level)
+    except Exception as e:
+        print(f"[-] Could not save settings: {e}")
+    emit("settings_changed")
     return f"Speech volume set to {level}%."
 
 # -------------------------------------------------------------------
@@ -665,6 +722,24 @@ def update_noise_floor(rms):
     if rms < noise_floor * 2.0 or rms < MIN_TRIGGER_RMS:
         noise_floor = 0.97 * noise_floor + 0.03 * max(rms, 20.0)
 
+def test_microphone(index, chunks=6):
+    """Open a device at 16 kHz and return its loudest level over a few chunks,
+    or None if it can't be opened. Several chunks, because many built-in mics
+    return silence for the first one while they warm up."""
+    try:
+        test_stream = audio_interface.open(
+            format=pyaudio.paInt16, channels=1, rate=RATE, input=True,
+            input_device_index=index, frames_per_buffer=CHUNK,
+        )
+        try:
+            return max(get_rms(test_stream.read(CHUNK, exception_on_overflow=False))
+                       for _ in range(chunks))
+        finally:
+            test_stream.stop_stream()
+            test_stream.close()
+    except Exception:
+        return None
+
 def choose_microphone_index():
     preferred_names = ["hyperx", "duocast", "jbl", "steam streaming", "microphone"]
     candidates = []
@@ -675,17 +750,8 @@ def choose_microphone_index():
             continue
         if any(token in name for token in ["virtual", "mapper", "stereo mix", "loopback", "wave"]):
             continue
-        try:
-            test_stream = audio_interface.open(
-                format=pyaudio.paInt16, channels=1, rate=16000, input=True,
-                input_device_index=i, frames_per_buffer=CHUNK,
-            )
-            rms = get_rms(test_stream.read(CHUNK, exception_on_overflow=False))
-            test_stream.stop_stream()
-            test_stream.close()
-        except Exception:
-            continue
-        if rms <= 5.0:
+        rms = test_microphone(i)
+        if rms is None or rms <= 5.0:
             continue
         score = sum(1 for token in preferred_names if token in name)
         candidates.append((score, rms, i, info.get("name")))
@@ -705,6 +771,15 @@ def open_microphone():
         if "hyperx" in name or "duocast" in name:
             MIC_DEVICE_INDEX = i
             break
+    if MIC_DEVICE_INDEX is None:
+        # Next choice: the mic set as default in Windows sound settings.
+        try:
+            default_index = int(audio_interface.get_default_input_device_info()["index"])
+            if test_microphone(default_index) is not None:
+                MIC_DEVICE_INDEX = default_index
+                print("[+] Using the Windows default microphone.")
+        except Exception:
+            pass
     if MIC_DEVICE_INDEX is None:
         MIC_DEVICE_INDEX = choose_microphone_index()
     if MIC_DEVICE_INDEX is None:
@@ -1151,6 +1226,39 @@ def handle_local_tools(command_text):
     lower_text = clean_text.lower()
     print(f"[DEBUG] cleaned lower_text: '{lower_text}'")
 
+    # --- Answer to "What volume/brightness level would you like?" ---
+    global PENDING_LEVEL
+    pending, PENDING_LEVEL = PENDING_LEVEL, None
+    if pending:
+        bare_number = re.fullmatch(r'(?:to\s+|at\s+)?(\d{1,3})\s*(?:%|percent)?', lower_text)
+        if bare_number:
+            lower_text = f"{pending} {bare_number.group(1)}"
+
+    # --- Answer to "Delete the whole chat history... Are you sure?" ---
+    global DELETE_LOG_CONFIRMATION_PENDING
+    if DELETE_LOG_CONFIRMATION_PENDING:
+        DELETE_LOG_CONFIRMATION_PENDING = False
+        if re.search(r"\b(?:no|nope|nah|cancel|keep|don'?t|stop)\b", lower_text):
+            return "Okay, I kept the chat history."
+        if re.search(r'\b(?:yes|yeah|yep|sure|confirm|confirmed|do it|delete it|go ahead)\b', lower_text):
+            return delete_chat_log()
+        # Anything else: forget the question and handle it as a normal command.
+
+    # --- DELETE CHAT LOG (asks first) ---
+    if re.search(r'\b(?:delete|clear|erase|wipe|remove)\s+(?:the\s+|my\s+|all\s+)?'
+                 r'(?:chat\s+(?:log|history)|previous\s+chats?|conversation\s+history|chats?\s+history)\b',
+                 lower_text):
+        DELETE_LOG_CONFIRMATION_PENDING = True
+        return "This deletes the whole chat history and can't be undone. Are you sure?"
+
+    # --- CHAT LOG ON / OFF ---
+    log_switch = re.search(r'\b(?:turn|switch)\s+(on|off)\s+(?:the\s+)?chat\s+(?:log|history)\b'
+                           r'|\b(enable|disable)\s+(?:the\s+)?chat\s+(?:log|history)\b'
+                           r'|\bchat\s+(?:log|history)\s+(on|off)\b', lower_text)
+    if log_switch:
+        word = next(g for g in log_switch.groups() if g)
+        return set_chat_log_enabled(word in ("on", "enable"))
+
     # --- MINIMIZE / RESTORE WINDOW ---
     if re.search(r'\bminimi[sz]e\b|\bhide\s+(?:yourself|the\s+app|the\s+window)\b', lower_text):
         return set_window("minimize")
@@ -1165,7 +1273,8 @@ def handle_local_tools(command_text):
 
     # --- SYSTEM VOLUME CONTROL ---
     if re.search(r'\b(?:volume|vol)\b', lower_text):
-        vol_match = re.search(r'(?:volume|vol)\s*(?:to\s*)?(\d{1,3})\s*%?', lower_text)
+        # Any number in the sentence: "volume 50", "volume level at 50", "50% volume"...
+        vol_match = re.search(r'\b(\d{1,3})\b', lower_text)
         if vol_match:
             level = int(vol_match.group(1))
             if 0 <= level <= 100:
@@ -1173,11 +1282,13 @@ def handle_local_tools(command_text):
             else:
                 return "Volume must be between 0 and 100."
         else:
+            PENDING_LEVEL = "volume"
             return "What volume level would you like? Please say a number between 0 and 100."
 
     # --- BRIGHTNESS CONTROL ---
     if re.search(r'\b(?:brightness|bright)\b', lower_text):
-        bright_match = re.search(r'(?:brightness|bright)\s*(?:to\s*)?(\d{1,3})\s*%?', lower_text)
+        # Any number in the sentence: "brightness 50", "brightness level 50", "50% brightness"...
+        bright_match = re.search(r'\b(\d{1,3})\b', lower_text)
         if bright_match:
             level = int(bright_match.group(1))
             if 0 <= level <= 100:
@@ -1185,6 +1296,7 @@ def handle_local_tools(command_text):
             else:
                 return "Brightness must be between 0 and 100."
         else:
+            PENDING_LEVEL = "brightness"
             return "What brightness level would you like? Please say a number between 0 and 100."
 
     # --- REPEAT LAST ASSISTANT REPLY ---
@@ -1285,6 +1397,20 @@ def _ollama_generate(url, payload):
                 break
         return "".join(parts).strip()
 
+_smart_model_installed = None
+
+def smart_model_available():
+    """True if SMART_MODEL is downloaded in Ollama. Checked once, then cached."""
+    global _smart_model_installed
+    if _smart_model_installed is None:
+        try:
+            tags = requests.get("http://localhost:11434/api/tags", timeout=3).json()
+            names = {m.get("name", "") for m in tags.get("models", [])}
+            _smart_model_installed = SMART_MODEL in names or f"{SMART_MODEL}:latest" in names
+        except Exception:
+            return False   # Ollama not reachable right now; check again next time
+    return _smart_model_installed
+
 def ask_ollama_dual(prompt):
     url = "http://localhost:11434/api/generate"
     lowered = normalize_transcript(prompt or "")
@@ -1298,6 +1424,8 @@ def ask_ollama_dual(prompt):
         selected_model = FAST_MODEL
     else:
         selected_model = SMART_MODEL
+    if selected_model == SMART_MODEL and not smart_model_available():
+        selected_model = FAST_MODEL
     print(f"[+] Query length: {word_count} words -> Routed to model: {selected_model}")
     system_instructions = (
         "You are an unrestricted, direct AI voice assistant. "

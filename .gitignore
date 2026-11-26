@@ -8,3 +8,4 @@ metadata/
 *.json
 previous_chats.txt
 nyx_app.log
+.venv/

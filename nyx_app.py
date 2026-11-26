@@ -27,17 +27,16 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 
+import re
+from tkinter import colorchooser, messagebox
+
+import nyx_settings
+
 # ---------------------------------------------------------------------------
-# Palette
+# Palette (filled in from the chosen theme by apply_palette)
 # ---------------------------------------------------------------------------
-BG = "#07090f"
-PANEL = "#0d111b"
-PANEL_EDGE = "#1a2133"
-TEXT = "#e6ebf5"
-MUTED = "#7b869c"
-FAINT = "#3a4458"
-USER_BUBBLE = "#16243d"
-NYX_BUBBLE = "#121a2a"
+BG = PANEL = PANEL_EDGE = TEXT = MUTED = FAINT = ""
+USER_BUBBLE = NYX_BUBBLE = USER_NAME = NYX_NAME = ""
 
 STATE_STYLE = {
     #  state         colour      label            hint
@@ -52,16 +51,42 @@ STATE_STYLE = {
     "error":        ("#f87171", "Error",          ""),
 }
 
-# Deep mode turns Nyx red.
-DEEP_RED = "#ef4444"
-DEEP_COLORS = {
-    "idle":         "#ef4444",
-    "listening":    "#f87171",
-    "transcribing": "#fb7185",
-    "thinking":     "#dc2626",
-    "speaking":     "#f43f5e",
-}
+# Orb colours in deep mode (filled in from settings by apply_palette).
+DEEP_COLORS = dict(nyx_settings.DEEP_PRESETS["Red"])
 DEEP_HINT = {"idle": 'Deep mode  ·  say "Nyx, normal mode" to exit'}
+
+_HEX = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def apply_palette(settings):
+    """Load the theme and orb colours from settings into the globals above."""
+    global BG, PANEL, PANEL_EDGE, TEXT, MUTED, FAINT
+    global USER_BUBBLE, NYX_BUBBLE, USER_NAME, NYX_NAME
+    t = nyx_settings.THEMES.get(settings.get("theme"), nyx_settings.THEMES[nyx_settings.DEFAULTS["theme"]])
+    BG, PANEL, PANEL_EDGE = t["bg"], t["panel"], t["panel_edge"]
+    TEXT, MUTED, FAINT = t["text"], t["muted"], t["faint"]
+    USER_BUBBLE, NYX_BUBBLE = t["user_bubble"], t["nyx_bubble"]
+    USER_NAME, NYX_NAME = t["user_name"], t["nyx_name"]
+    colours = settings.get("orb_colors", {})
+    for state in nyx_settings.ORB_STATES:
+        colour = colours.get(state, "")
+        if not _HEX.fullmatch(str(colour)):
+            colour = nyx_settings.DEFAULTS["orb_colors"][state]
+        STATE_STYLE[state] = (colour,) + STATE_STYLE[state][1:]
+    deep = settings.get("deep_colors", {})
+    for state in nyx_settings.ORB_STATES:
+        colour = deep.get(state, "")
+        DEEP_COLORS[state] = colour if _HEX.fullmatch(str(colour)) else nyx_settings.DEEP_PRESETS["Red"][state]
+
+
+def accent():
+    return STATE_STYLE["idle"][0]
+
+
+def _readable_on(colour):
+    """Near-black or white, whichever reads better on this background."""
+    r, g, b = _hex_to_rgb(colour)
+    return "#0b0f19" if (0.299 * r + 0.587 * g + 0.114 * b) > 140 else "#ffffff"
 
 
 def _hex_to_rgb(h):
@@ -257,6 +282,269 @@ class GlassBox:
 
 
 # ---------------------------------------------------------------------------
+# Settings window
+# ---------------------------------------------------------------------------
+class SettingsWindow:
+    """Theme, orb colours, deep mode colours, voice volume, chat log.
+    Every change is applied and saved immediately - there is no Save button."""
+
+    def __init__(self, app):
+        self.app = app
+        self.s = json_copy(app.settings)
+        self._volume_job = None
+
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Nyx settings")
+        win.resizable(False, False)
+        win.transient(app.root)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        win.bind("<Escape>", lambda e: self.close())
+
+        self._build()
+        win.update_idletasks()
+        root = app.root
+        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_width()) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.focus_force()
+
+    # -------------------------------------------------- layout
+    def _build(self):
+        """(Re)create the window contents with the current palette."""
+        for child in self.win.winfo_children():
+            child.destroy()
+        f_ui, f_head = self.app.f_ui, self.app.f_head
+        self.win.configure(bg=PANEL)
+
+        head = tk.Frame(self.win, bg=PANEL)
+        head.pack(fill="x", padx=28, pady=(22, 0))
+        tk.Label(head, text="Settings", bg=PANEL, fg=TEXT, font=(f_head, 18)).pack(side="left")
+        tk.Label(head, text="Changes apply right away", bg=PANEL, fg=MUTED,
+                 font=(f_ui, 9)).pack(side="left", padx=(14, 0), pady=(8, 0))
+
+        cols = tk.Frame(self.win, bg=PANEL)
+        cols.pack(fill="both", expand=True, padx=28, pady=(4, 6))
+        left = tk.Frame(cols, bg=PANEL)
+        left.pack(side="left", fill="y", anchor="n")
+        tk.Frame(cols, bg=PANEL_EDGE, width=1).pack(side="left", fill="y", padx=26, pady=(18, 0))
+        right = tk.Frame(cols, bg=PANEL)
+        right.pack(side="left", fill="y", anchor="n")
+
+        # ---- left: appearance
+        self._section(left, "APPEARANCE")
+        self._label(left, "Theme")
+        row = tk.Frame(left, bg=PANEL)
+        row.pack(anchor="w", pady=(4, 14))
+        for name, t in nyx_settings.THEMES.items():
+            on = name == self.s["theme"]
+            chip = tk.Label(row, text=name, bg=t["bg"], fg=t["text"], padx=12, pady=7,
+                            font=(f_ui, 10, "bold" if on else "normal"), cursor="hand2",
+                            highlightthickness=2,
+                            highlightbackground=accent() if on else PANEL_EDGE)
+            chip.pack(side="left", padx=(0, 6))
+            chip.bind("<Button-1>", lambda e, n=name: self._set(theme=n))
+
+        self._label(left, "Orb colours")
+        self._colour_picker(left, "orb_preset", "orb_colors", nyx_settings.ORB_PRESETS)
+
+        self._section(left, "DEEP MODE COLOURS")
+        self._check(left, "Change the orb colours while deep mode is on",
+                    "deep_colors_enabled")
+        self._colour_picker(left, "deep_preset", "deep_colors", nyx_settings.DEEP_PRESETS,
+                            dim=not self.s["deep_colors_enabled"])
+
+        # ---- right: voice, window, chat
+        self._section(right, "VOICE")
+        self._label(right, "Nyx's voice volume")
+        self.volume = tk.IntVar(value=int(self.s["speech_volume"]))
+        vol_row = tk.Frame(right, bg=PANEL)
+        vol_row.pack(anchor="w", pady=(6, 0))
+        # bd=0 + no value label: the widget is only trough + handle, so bg colours the handle.
+        tk.Scale(vol_row, from_=0, to=100, orient="horizontal", variable=self.volume, length=280,
+                 width=12, sliderlength=22, showvalue=False, bg=accent(),
+                 troughcolor=_mix(PANEL, TEXT, 0.12), highlightthickness=0, bd=0,
+                 activebackground=_mix(accent(), TEXT, 0.25), sliderrelief="flat",
+                 command=lambda v: self._volume_changed()).pack(side="left")
+        tk.Label(vol_row, textvariable=self.volume, bg=PANEL, fg=TEXT, width=4,
+                 font=(f_ui, 10)).pack(side="left", padx=(10, 0))
+        tk.Label(vol_row, text="%", bg=PANEL, fg=MUTED, font=(f_ui, 10)).pack(side="left")
+
+        self._section(right, "MIC MUTED")
+        self._label(right, "Orb colour while the mic is off")
+        row = tk.Frame(right, bg=PANEL)
+        row.pack(anchor="w", pady=(4, 0))
+        normal = self.s["orb_colors"].get("idle", accent())
+        deep = self.s["deep_colors"].get("idle", normal)
+        for value, text, dots in (("grey", "Grey", [STATE_STYLE["muted"][0]]),
+                                  ("mode", "Current mode", [normal, deep])):
+            on = self.s.get("muted_color", "grey") == value
+            chip = tk.Frame(row, bg=_mix(PANEL, accent(), 0.18) if on else PANEL, cursor="hand2",
+                            highlightthickness=2,
+                            highlightbackground=accent() if on else PANEL_EDGE)
+            chip.pack(side="left", padx=(0, 6))
+            parts = [tk.Label(chip, text="●", bg=chip["bg"], fg=d, font=(f_ui, 10))
+                     for d in dots]
+            parts.append(tk.Label(chip, text=text, bg=chip["bg"], fg=TEXT, font=(f_ui, 10)))
+            for i, part in enumerate(parts):
+                part.pack(side="left", padx=(10 if i == 0 else 2, 10 if i == len(parts) - 1 else 0),
+                          pady=6)
+            for w in [chip] + parts:
+                w.bind("<Button-1>", lambda e, v=value: self._set(muted_color=v))
+        tk.Label(right, text="Current mode = the Standing by colour, or the deep\n"
+                             "mode colour while deep mode is on.",
+                 bg=PANEL, fg=FAINT, font=(f_ui, 8), justify="left").pack(anchor="w", pady=(4, 0))
+
+        self._section(right, "WINDOW")
+        self._check(right, "Start in fullscreen (F11 switches any time)", "start_fullscreen")
+
+        self._section(right, "CHAT HISTORY")
+        self._check(right, "Save conversations to the chat log\n(previous_chats.txt)",
+                    "chat_log_enabled")
+        danger = tk.Label(right, text="🗑  Delete chat history…", bg=PANEL, fg="#f87171",
+                          font=(f_ui, 10), padx=12, pady=6, cursor="hand2",
+                          highlightthickness=1, highlightbackground="#7f1d1d")
+        danger.pack(anchor="w", pady=(8, 0))
+        danger.bind("<Button-1>", lambda e: self._delete_history())
+        self.delete_note = tk.Label(right, text="", bg=PANEL, fg=MUTED, font=(f_ui, 9))
+        self.delete_note.pack(anchor="w", pady=(4, 0))
+
+        # ---- bottom bar
+        bar = tk.Frame(self.win, bg=PANEL)
+        bar.pack(fill="x", padx=28, pady=(10, 22))
+        reset = tk.Label(bar, text="Reset to defaults", bg=PANEL, fg=MUTED, font=(f_ui, 9),
+                         cursor="hand2")
+        reset.pack(side="left")
+        reset.bind("<Button-1>", lambda e: self._reset())
+        self.app._button(bar, "Done", self.close, accent=True).pack(side="right")
+
+    def _colour_picker(self, parent, preset_key, colours_key, presets, dim=False):
+        """Preset chips + one clickable swatch per orb state."""
+        f_ui = self.app.f_ui
+        current = self.s[preset_key]
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(anchor="w", pady=(4, 8))
+        for name in list(presets) + ["Custom"]:
+            on = name == current
+            dot = presets.get(name, {}).get("idle", MUTED)
+            chip = tk.Label(row, text=("●  " if name != "Custom" else "✎  ") + name,
+                            bg=_mix(PANEL, accent(), 0.18) if on else PANEL,
+                            fg=TEXT if on else (_mix(PANEL, dot, 0.5) if dim else dot),
+                            font=(f_ui, 10), padx=10, pady=6, cursor="hand2",
+                            highlightthickness=2,
+                            highlightbackground=accent() if on else PANEL_EDGE)
+            chip.pack(side="left", padx=(0, 6))
+            chip.bind("<Button-1>", lambda e, n=name: self._pick_preset(preset_key, colours_key,
+                                                                        presets, n))
+        swatches = tk.Frame(parent, bg=PANEL)
+        swatches.pack(anchor="w", pady=(2, 0))
+        for state in nyx_settings.ORB_STATES:
+            colour = self.s[colours_key].get(state, MUTED)
+            cell = tk.Frame(swatches, bg=PANEL)
+            cell.pack(side="left", padx=(0, 14))
+            sw = tk.Label(cell, width=8, height=2, cursor="hand2", highlightthickness=1,
+                          bg=_mix(PANEL, colour, 0.45) if dim else colour,
+                          highlightbackground=PANEL_EDGE)
+            sw.pack()
+            sw.bind("<Button-1>", lambda e, st=state: self._pick_colour(preset_key, colours_key, st))
+            tk.Label(cell, text=nyx_settings.ORB_STATE_NAMES[state], bg=PANEL, fg=MUTED,
+                     font=(f_ui, 8)).pack(pady=(3, 0))
+        tk.Label(parent, text="Click a colour to pick your own.", bg=PANEL, fg=FAINT,
+                 font=(f_ui, 8)).pack(anchor="w", pady=(4, 0))
+
+    def _section(self, parent, text):
+        tk.Label(parent, text=text, bg=PANEL, fg=MUTED,
+                 font=(self.app.f_ui, 8, "bold")).pack(anchor="w", pady=(18, 6))
+
+    def _label(self, parent, text):
+        tk.Label(parent, text=text, bg=PANEL, fg=TEXT, font=(self.app.f_ui, 10)).pack(anchor="w")
+
+    def _check(self, parent, text, key):
+        var = tk.BooleanVar(value=bool(self.s[key]))
+        tk.Checkbutton(parent, text=text, variable=var, bg=PANEL, fg=TEXT, selectcolor=BG,
+                       activebackground=PANEL, activeforeground=TEXT, bd=0, highlightthickness=0,
+                       justify="left", font=(self.app.f_ui, 10), cursor="hand2",
+                       command=lambda: self._set(**{key: bool(var.get())})).pack(anchor="w", pady=2)
+
+    # -------------------------------------------------- changes
+    def _set(self, **changes):
+        """Apply + save a change. Colour changes also redraw both windows."""
+        self.s.update(changes)
+        visual = any(k in changes for k in ("theme", "orb_colors", "deep_colors", "muted_color",
+                                            "deep_colors_enabled", "orb_preset", "deep_preset"))
+        self.app.apply_settings(json_copy(self.s), rebuild=visual)
+        if visual:
+            self._build()
+
+    def _pick_preset(self, preset_key, colours_key, presets, name):
+        changes = {preset_key: name}
+        if name in presets:
+            changes[colours_key] = dict(presets[name])
+        self._set(**changes)
+
+    def _pick_colour(self, preset_key, colours_key, state):
+        current = self.s[colours_key].get(state, accent())
+        _, chosen = colorchooser.askcolor(color=current, parent=self.win,
+                                          title=f"Colour: {nyx_settings.ORB_STATE_NAMES[state]}")
+        if chosen:
+            colours = dict(self.s[colours_key])
+            colours[state] = chosen.lower()
+            self._set(**{colours_key: colours, preset_key: "Custom"})
+
+    def _volume_changed(self):
+        # Nyx's voice changes at once; saving waits until the slider stops moving.
+        value = int(self.volume.get())
+        self.s["speech_volume"] = value
+        if self.app.engine is not None:
+            self.app.engine.SPEECH_VOLUME = value
+        if self._volume_job is not None:
+            self.win.after_cancel(self._volume_job)
+        self._volume_job = self.win.after(400, lambda: self._set(speech_volume=value))
+
+    def _reset(self):
+        self.s = json_copy(nyx_settings.DEFAULTS)
+        self.app.apply_settings(json_copy(self.s), rebuild=True)
+        self._build()
+
+    def _delete_history(self):
+        if messagebox.askyesno("Delete chat history",
+                               "Delete the whole chat history (previous_chats.txt)?\n"
+                               "This can't be undone.", icon="warning", parent=self.win):
+            self.delete_note.configure(text=self.app.delete_chat_history())
+
+    def sync_engine_values(self, fresh):
+        """Voice commands changed these while the window was open."""
+        self.s["speech_volume"] = int(fresh["speech_volume"])
+        self.s["chat_log_enabled"] = bool(fresh["chat_log_enabled"])
+        self._build()
+
+    def close(self):
+        if self._volume_job is not None:          # save a pending volume change
+            self.win.after_cancel(self._volume_job)
+            self._volume_job = None
+            self.app.apply_settings(json_copy(self.s), rebuild=False)
+        self.app.settings_window = None
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        # Windows may hand focus to another program when this window closes.
+        root = self.app.root
+        root.lift()
+        root.focus_force()
+
+
+def json_copy(value):
+    import json
+    return json.loads(json.dumps(value))
+
+
+def accent_of(settings):
+    colour = settings.get("orb_colors", {}).get("idle", "")
+    return colour if _HEX.fullmatch(str(colour)) else accent()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class NyxApp:
@@ -273,6 +561,12 @@ class NyxApp:
         self.last_frame = time.time()
         self.level_rms = 0.0
         self.threshold_rms = 1.0
+        self.settings = nyx_settings.load()
+        apply_palette(self.settings)
+        self.history = []            # chat contents, so the UI can be rebuilt on a theme change
+        self.engine_text = "starting…"
+        self.mic_name_text = ""
+        self.settings_window = None
 
         self.f_ui = _pick_font(root, "Segoe UI Variable Text", "Segoe UI", "Helvetica")
         self.f_head = _pick_font(root, "Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI", "Helvetica")
@@ -283,9 +577,10 @@ class NyxApp:
         root.geometry("1060x680")
         root.minsize(900, 600)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.attributes("-fullscreen", True)   # F11 toggles
+        root.attributes("-fullscreen", bool(self.settings["start_fullscreen"]))   # F11 toggles
 
         self._build()
+        self._system("Nyx is starting up…")
         self._bind_keys()
         self._start_engine()
         self.root.after(16, self._frame)
@@ -305,9 +600,10 @@ class NyxApp:
         brand = tk.Frame(left, bg=BG)
         brand.pack(fill="x", padx=28, pady=(24, 0))
         tk.Label(brand, text="N Y X", bg=BG, fg=TEXT, font=(self.f_head, 18, "bold")).pack(side="left")
-        self.engine_label = tk.Label(brand, text="starting…", bg=BG, fg=MUTED, font=(self.f_ui, 9))
+        self.engine_label = tk.Label(brand, text=self.engine_text, bg=BG, fg=MUTED, font=(self.f_ui, 9))
         self.engine_label.pack(side="left", padx=(12, 0), pady=(6, 0))
-        self.deep_badge = tk.Label(brand, text=" DEEP MODE ", bg=DEEP_RED, fg="#ffffff",
+        self.deep_badge = tk.Label(brand, text=" DEEP MODE ", bg=DEEP_COLORS["idle"],
+                                   fg=_readable_on(DEEP_COLORS["idle"]),
                                    font=(self.f_ui, 8, "bold"))  # shown only in deep mode
 
         # Everything below the brand row stays vertically centred (matters in fullscreen).
@@ -332,7 +628,7 @@ class NyxApp:
         top = tk.Frame(meter_box, bg=BG)
         top.pack(fill="x")
         tk.Label(top, text="MIC", bg=BG, fg=MUTED, font=(self.f_ui, 8, "bold")).pack(side="left")
-        self.mic_name = tk.Label(top, text="", bg=BG, fg=FAINT, font=(self.f_ui, 8))
+        self.mic_name = tk.Label(top, text=self.mic_name_text, bg=BG, fg=FAINT, font=(self.f_ui, 8))
         self.mic_name.pack(side="right")
         self.meter = tk.Canvas(meter_box, height=8, bg=PANEL, highlightthickness=0)
         self.meter.pack(fill="x", pady=(4, 0))
@@ -346,6 +642,7 @@ class NyxApp:
         self.mic_btn.pack(side="left", padx=5)
         self._button(controls, "■  Stop talking", self.skip_speech).pack(side="left", padx=5)
         self._button(controls, "▁  Minimize", self.minimize).pack(side="left", padx=5)
+        self._button(controls, "⚙  Settings", self.open_settings).pack(side="left", padx=5)
 
         # ---- right: conversation panel
         right = tk.Frame(root, bg=PANEL, highlightthickness=1, highlightbackground=PANEL_EDGE)
@@ -366,7 +663,7 @@ class NyxApp:
         body.grid_columnconfigure(0, weight=1)
         self.chat = tk.Text(body, bg=PANEL, fg=TEXT, bd=0, highlightthickness=0, wrap="word",
                             font=(self.f_ui, 11), padx=6, pady=6, cursor="arrow",
-                            insertbackground=PANEL, selectbackground="#2b3a5c")
+                            insertbackground=PANEL, selectbackground=_mix(PANEL, accent(), 0.35))
         self.chat.grid(row=0, column=0, sticky="nsew")
         scroll = tk.Scrollbar(body, command=self.chat.yview, width=10, bd=0,
                               troughcolor=PANEL, bg=PANEL_EDGE, activebackground=FAINT)
@@ -402,12 +699,32 @@ class NyxApp:
         send = self._button(bar, "Send  ➜", self.send_text, accent=True)
         send.grid(row=0, column=1, padx=(10, 0), sticky="ns")
 
-        self._system("Nyx is starting up…")
+    def rebuild_ui(self):
+        """Redraw the whole window with the current palette, keeping the chat."""
+        for child in self.root.winfo_children():
+            if not isinstance(child, tk.Toplevel):
+                child.destroy()
+        self.root.configure(bg=BG)
+        self.bubbles = []
+        self._build()
+        history, self.history = self.history, []
+        for entry in history:
+            if entry[0] == "system":
+                self._system(entry[1])
+            elif entry[0] == "user":
+                self.add_user(entry[1])
+            else:
+                self.add_nyx(entry[1], entry[2])
+        if self.deep_mode:
+            self.deep_badge.pack(side="right", pady=(6, 0))
+        self._refresh_mic_button()
+        self.set_state(self.state)
+        self.orb.color = self.orb.target_color   # no fade-in from grey
 
     def _button(self, parent, text, command, accent=False):
         bg = STATE_STYLE["idle"][0] if accent else PANEL
-        fg = BG if accent else TEXT
-        hover = _mix(bg, "#ffffff", 0.15)
+        fg = _readable_on(bg) if accent else TEXT
+        hover = _mix(bg, TEXT, 0.12)
         b = tk.Label(parent, text=text, bg=bg, fg=fg, font=(self.f_ui, 10, "bold" if accent else "normal"),
                      padx=16, pady=8, cursor="hand2", highlightthickness=0 if accent else 1,
                      highlightbackground=PANEL_EDGE)
@@ -446,6 +763,7 @@ class NyxApp:
         self.root.bind("<Control-l>", lambda e: self.clear_chat())
         self.root.bind("<F11>", lambda e: self.toggle_fullscreen())
         self.root.bind("<Control-h>", lambda e: self.minimize())
+        self.root.bind("<Control-comma>", lambda e: self.open_settings())
         self.root.bind("<Map>", self._on_map)
 
     def toggle_fullscreen(self):
@@ -557,6 +875,7 @@ class NyxApp:
         self.chat.see("end")
 
     def _system(self, text):
+        self.history.append(("system", text))
         self._append((text + "\n", "system"))
 
     def _bubble(self, who, text, side, bg, who_fg, kind=None):
@@ -581,12 +900,15 @@ class NyxApp:
         self.chat.see("end")
 
     def add_user(self, text):
-        self._bubble("YOU", text, "right", USER_BUBBLE, "#7dd3fc")
+        self.history.append(("user", text))
+        self._bubble("YOU", text, "right", USER_BUBBLE, USER_NAME)
 
     def add_nyx(self, text, kind=None):
-        self._bubble("NYX", text, "left", NYX_BUBBLE, "#a7f3d0", kind)
+        self.history.append(("nyx", text, kind))
+        self._bubble("NYX", text, "left", NYX_BUBBLE, NYX_NAME, kind)
 
     def clear_chat(self):
+        self.history.clear()
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.configure(state="disabled")
@@ -664,11 +986,22 @@ class NyxApp:
                 self.deep_badge.pack_forget()
             self.set_state(self.state)
         elif kind == "mic_name":
-            self.mic_name.configure(text=str(ev.get("value", ""))[:42])
+            self.mic_name_text = str(ev.get("value", ""))[:42]
+            self.mic_name.configure(text=self.mic_name_text)
+        elif kind == "chat_deleted":
+            self.clear_chat()
+        elif kind == "settings_changed":
+            # Changed by voice (speech volume / chat log on-off).
+            fresh = nyx_settings.load()
+            for key in ("speech_volume", "chat_log_enabled"):
+                self.settings[key] = fresh[key]
+            if self.settings_window is not None:
+                self.settings_window.sync_engine_values(fresh)
         elif kind == "ready":
             self._system("Online. Say \"Nyx\" followed by a command, or type below.")
             model = os.path.basename(str(ev.get("model") or ""))
-            self.engine_label.configure(text=f"whisper {model}" if model else "online")
+            self.engine_text = f"whisper {model}" if model else "online"
+            self.engine_label.configure(text=self.engine_text)
         elif kind == "error":
             self._system("Error: " + ev.get("text", ""))
             self.set_state("error")
@@ -686,8 +1019,12 @@ class NyxApp:
             self.level_rms = 0.0   # no level events arrive in these states
         shown ="muted" if (not self.mic_enabled and value == "idle") else value
         colour, label, hint = STATE_STYLE.get(shown, STATE_STYLE["idle"])
-        if self.deep_mode and shown in DEEP_COLORS:
+        if self._deep_colours_on() and shown in DEEP_COLORS:
             colour = DEEP_COLORS[shown]
+        if shown == "muted":
+            colour = self.muted_colour()
+        self._refresh_mic_button()
+        if self.deep_mode:
             hint = DEEP_HINT.get(shown, hint)
         self.orb.set_state(shown, colour)
         self.state_label.configure(text=label)
@@ -695,9 +1032,18 @@ class NyxApp:
             self.hint_label.configure(text=hint)
         self.meter.itemconfig(self.meter_fill, fill=colour)
 
+    def _deep_colours_on(self):
+        return self.deep_mode and self.settings.get("deep_colors_enabled", True)
+
+    def muted_colour(self):
+        """Orb colour while the mic is off: grey, or the current mode's colour."""
+        if self.settings.get("muted_color") == "mode":
+            return DEEP_COLORS["idle"] if self._deep_colours_on() else STATE_STYLE["idle"][0]
+        return STATE_STYLE["muted"][0]
+
     def _refresh_mic_button(self):
         self.mic_btn.configure(text="●  Mic on" if self.mic_enabled else "○  Mic off",
-                               fg=TEXT if self.mic_enabled else STATE_STYLE["muted"][0])
+                               fg=TEXT if self.mic_enabled else self.muted_colour())
 
     # ------------------------------------------------------------- actions
     def send_text(self):
@@ -712,6 +1058,42 @@ class NyxApp:
         if self.engine.is_end_task(text) and self.engine.cancel_thinking():
             return
         self.commands.put(text)
+
+    def open_settings(self):
+        if self.settings_window is not None:
+            self.settings_window.win.lift()
+            self.settings_window.win.focus_force()
+            return
+        self.settings_window = SettingsWindow(self)
+
+    def apply_settings(self, settings, rebuild=True):
+        """Save new settings and apply them right away.
+        rebuild: redraw the window (needed for colour changes)."""
+        try:
+            nyx_settings.save(settings)
+        except OSError as exc:
+            self._system(f"Could not save settings: {exc}")
+        self.settings = settings
+        if self.engine is not None:
+            self.engine.SPEECH_VOLUME = int(settings["speech_volume"])
+            self.engine.CHAT_LOG_ENABLED = bool(settings["chat_log_enabled"])
+        if rebuild:
+            apply_palette(settings)
+            self.rebuild_ui()
+
+    def delete_chat_history(self):
+        """Delete previous_chats.txt (Settings button). Returns a message."""
+        if self.engine is not None:
+            msg = self.engine.delete_chat_log(skip_next_log=False)
+        else:
+            try:
+                (nyx_settings.SETTINGS_FILE.parent / "previous_chats.txt").unlink(missing_ok=True)
+                msg = "Chat history deleted."
+            except OSError as exc:
+                msg = f"Could not delete the chat history: {exc}"
+            self.clear_chat()
+        self._system(msg)
+        return msg
 
     def toggle_mic(self):
         if self.engine is None:

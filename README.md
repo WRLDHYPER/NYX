@@ -7,9 +7,29 @@ local AI model.
 
 - Speech-to-text: **faster-whisper** (Whisper large-v3)
 - Voice: **Piper** text-to-speech
-- AI chat: **Ollama** (`dolphin-llama3:8b` for quick answers, `qwen2.5:14b` for deep mode)
+- AI chat: **Ollama** (`dolphin-llama3:8b`; optionally `qwen2.5:14b` for deep mode on a strong GPU)
 
 For everything you can say to Nyx, see **[COMMANDS.txt](COMMANDS.txt)**.
+
+---
+
+## Easy install: setup.bat
+
+Put the NYX folder where you want it (for example `C:\NYX`) and double-click
+**`setup.bat`**. It installs Nyx right there and downloads everything below by
+itself: Python 3.11 (if missing), the Python packages, the NVIDIA CUDA libraries
+(if you have an NVIDIA card), the Whisper model, Ollama and both AI models, and the
+Piper voice. Then it puts a **NYX** shortcut on your desktop and in the Start Menu.
+It's about 9–10 GB of downloads. Run it again any time to repair the install.
+
+Setup also asks whether to install the **smart model** (`qwen2.5:14b`, ~9 GB more).
+Nyx uses it for long questions and deep mode if it's installed, and the fast model
+for everything otherwise. It's only worth it with a strong NVIDIA card.
+
+To change the voice, AI models or Whisper models it downloads, edit the
+**Settings** block at the top of `setup.bat`.
+
+The steps below are the manual way to do the same thing.
 
 ---
 
@@ -153,6 +173,7 @@ The first start takes a little while (loading the models). When Nyx says
 | **Ctrl+H** minimize | **Space** cancel a shutdown |
 | **F11** fullscreen on/off | |
 | **Ctrl+L** clear chat | |
+| **Ctrl+,** settings | |
 | **Space** cancel a shutdown (while the countdown shows) | |
 | **Alt+F4** close | |
 
@@ -166,9 +187,9 @@ The first start takes a little while (loading the models). When Nyx says
 - **Nyx doesn't wake up / wakes up too easily**: in `assistant.py`, lower or raise
   `NOISE_MULTIPLIER` and `MIN_TRIGGER_RMS`. Set `WAKE_WORD_DEBUG = True` to see
   live microphone levels in the console.
-- **Wrong microphone**: Nyx prefers HyperX/DuoCast mics, then picks the loudest
-  working mic. Set your mic as the Windows default, or edit `open_microphone()`
-  in `assistant.py`.
+- **Wrong microphone**: Nyx prefers HyperX/DuoCast mics, then the Windows default
+  mic, then the loudest working mic. Set your mic as the Windows default
+  (Settings → System → Sound → Input), or edit `open_microphone()` in `assistant.py`.
 - **No voice**: check that the two voice files from step 5 are in `voices`.
 - **Volume control doesn't work**: run `py -3.11 -m pip install pycaw comtypes`, or install
   [NirCmd](https://www.nirsoft.net/utils/nircmd.html) and put it on your PATH.
@@ -179,8 +200,11 @@ The first start takes a little while (loading the models). When Nyx says
 
 | File | What it is |
 |---|---|
-| `nyx_app.py` | The app window (orb, chat, buttons) |
+| `nyx_app.py` | The app window (orb, chat, buttons, settings) |
+| `nyx_settings.py` | Settings and the themes / orb colour presets |
+| `settings.json` | Your settings (saved as soon as you change one in Settings) |
 | `assistant.py` | The engine: listening, speech-to-text, commands, voice |
+| `setup.bat` | Downloads and installs everything Nyx needs |
 | `run_app.bat` | Starts the app |
 | `run_assistant.bat` | Starts the console version |
 | `COMMANDS.txt` | Everything you can say to Nyx |

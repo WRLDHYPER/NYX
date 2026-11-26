@@ -57,6 +57,11 @@ FILES & CHAT HISTORY
   "Nyx, read chat log"               Shows the last 10 conversations
   "Nyx, show previous chats"         (same)
   "Nyx, read full chat log"          Shows the whole chat history
+  "Nyx, delete chat log"             Deletes the whole chat history (asks first,
+        answer "yes" or "no")
+        also: "clear chat history", "erase previous chats"
+  "Nyx, turn off chat log"           Stop saving conversations
+  "Nyx, turn on chat log"            Save them again
   "Nyx, repeat that"                 Repeats Nyx's last answer
         also: "say that again", "what did you say", "repeat"
 
@@ -114,7 +119,8 @@ KEYBOARD SHORTCUTS
     Ctrl+M     Mic on / off
     Esc        Stop Nyx talking / end task while thinking
     Ctrl+L     Clear the conversation
-    F11        Fullscreen on / off (the app starts fullscreen)
+    F11        Fullscreen on / off
+    Ctrl+,     Settings (theme, orb colours, voice volume, chat log)
     Ctrl+H     Minimize
     Space      Abort a shutdown (while the countdown is showing)
     Alt+F4     Close the app
