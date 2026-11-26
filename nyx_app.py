@@ -252,10 +252,19 @@ class GlassBox:
                                        width=2, fill="#140606")
         self.text(rel_y, text, font, tag="button")
         self.outlines.append(rect)
-        for item in (rect, self.texts["button"]):
-            self.c.tag_bind(item, "<Button-1>", lambda e: command())
-            self.c.tag_bind(item, "<Enter>", lambda e: self.c.configure(cursor="hand2"))
-            self.c.tag_bind(item, "<Leave>", lambda e: self.c.configure(cursor=""))
+
+        # The box is two stacked windows, and Windows may put the tint window on
+        # top, so it gets the clicks. Hit-test by screen position on both windows
+        # instead of relying on canvas item bindings.
+        def over_button(e):
+            x = e.x_root - self.c.winfo_rootx()
+            y = e.y_root - self.c.winfo_rooty()
+            return x0 <= x <= x0 + bw and y0 <= y <= y0 + bh
+
+        for win in (self.front, self.back):
+            win.bind("<Button-1>", lambda e: command() if over_button(e) else None)
+            win.bind("<Motion>", lambda e, w=win: w.configure(
+                cursor="hand2" if over_button(e) else ""))
 
     def set_text(self, tag, value):
         self.c.itemconfigure(self.texts[tag], text=value)
@@ -292,6 +301,7 @@ class SettingsWindow:
         self.app = app
         self.s = json_copy(app.settings)
         self._volume_job = None
+        self._scan_devices()
 
         win = self.win = tk.Toplevel(app.root)
         win.title("Nyx settings")
@@ -369,6 +379,24 @@ class SettingsWindow:
         tk.Label(vol_row, textvariable=self.volume, bg=PANEL, fg=TEXT, width=4,
                  font=(f_ui, 10)).pack(side="left", padx=(10, 0))
         tk.Label(vol_row, text="%", bg=PANEL, fg=MUTED, font=(f_ui, 10)).pack(side="left")
+
+        self._section(right, "AUDIO DEVICES")
+        self._label(right, "Speaker")
+        self._device_menu(right, "speaker",
+                          [("", "Windows default")] + [(n, n) for n in self.speakers])
+        self._label(right, "Microphone")
+        self._device_menu(right, "microphone",
+                          [("", "Automatic (HyperX, else Windows default)"),
+                           (nyx_settings.MIC_WINDOWS_DEFAULT, "Windows default")]
+                          + [(n, n) for n in self.mics])
+        hint_row = tk.Frame(right, bg=PANEL)
+        hint_row.pack(anchor="w", fill="x")
+        tk.Label(hint_row, text="If a device is unplugged, Nyx uses the Windows default.",
+                 bg=PANEL, fg=FAINT, font=(f_ui, 8)).pack(side="left")
+        refresh = tk.Label(hint_row, text="↻ Refresh list", bg=PANEL, fg=accent(),
+                           font=(f_ui, 8), cursor="hand2")
+        refresh.pack(side="left", padx=(10, 0))
+        refresh.bind("<Button-1>", lambda e: (self._scan_devices(), self._build()))
 
         self._section(right, "MIC MUTED")
         self._label(right, "Orb colour while the mic is off")
@@ -458,6 +486,36 @@ class SettingsWindow:
 
     def _label(self, parent, text):
         tk.Label(parent, text=text, bg=PANEL, fg=TEXT, font=(self.app.f_ui, 10)).pack(anchor="w")
+
+    def _scan_devices(self):
+        """List speakers and mics. Re-scans for newly plugged-in devices
+        unless Nyx is talking (re-scanning would cut the audio off)."""
+        engine = self.app.engine
+        refresh = engine is None or not getattr(engine, "SPEAKING_IN_PROGRESS", False)
+        try:
+            self.speakers = nyx_settings.list_audio_devices("output", refresh=refresh)
+            self.mics = nyx_settings.list_audio_devices("input")
+        except Exception as exc:
+            print(f"[settings] Could not list audio devices: {exc}")
+            self.speakers, self.mics = [], []
+
+    def _device_menu(self, parent, key, options):
+        """Dropdown of (value, label) pairs; the saved value is selected."""
+        current = self.s.get(key, "")
+        if current and current not in [v for v, _ in options]:
+            options = options + [(current, f"{current}  (not connected)")]
+        labels = {v: text for v, text in options}
+        var = tk.StringVar(value=labels.get(current, options[0][1]))
+        menu = tk.OptionMenu(parent, var, *[text for _, text in options],
+                             command=lambda text: self._set(**{key: next(
+                                 v for v, t in options if t == text)}))
+        menu.configure(bg=_mix(PANEL, TEXT, 0.06), fg=TEXT, activebackground=_mix(PANEL, TEXT, 0.12),
+                       activeforeground=TEXT, highlightthickness=1, highlightbackground=PANEL_EDGE,
+                       relief="flat", bd=0, anchor="w", width=40, font=(self.app.f_ui, 10),
+                       cursor="hand2", padx=10, pady=5)
+        menu["menu"].configure(bg=PANEL, fg=TEXT, activebackground=accent(),
+                               activeforeground=BG, font=(self.app.f_ui, 10), bd=0)
+        menu.pack(anchor="w", pady=(4, 10))
 
     def _check(self, parent, text, key):
         var = tk.BooleanVar(value=bool(self.s[key]))
@@ -797,21 +855,25 @@ class NyxApp:
         sh = self.root.winfo_screenheight()
         return int(sh * 0.62), int(sh * 0.40)
 
-    def show_countdown(self, deadline):
+    def show_countdown(self, deadline, action="shutdown"):
         self.shutdown_deadline = deadline
+        self.power_action = action
         if self.root.state() == "iconic":
             self.restore()
         if getattr(self, "countdown_box", None) is None:
             w, h = self._box_size()
             big = max(70, int(self.root.winfo_screenheight() * 0.11))
             box = GlassBox(self.root, w, h, "#ef4444", tint="#dc2626")
-            box.text(0.17, "SYSTEM SHUTDOWN", (self.f_head, 28, "bold"), tag="title")
+            box.text(0.17, f"SYSTEM {action.upper()}", (self.f_head, 28, "bold"), tag="title")
             box.text(0.47, "20", (self.f_head, big, "bold"), tag="number")
             box.text(0.73, 'Say "Nyx, abort"  ·  press Space  ·  or click ABORT',
                      (self.f_ui, 13), tag="sub")
             box.button(0.87, "ABORT", (self.f_head, 16, "bold"), self.abort_shutdown)
             self.countdown_box = box
             self.root.bind("<space>", lambda e: self.abort_shutdown())
+            for win in (box.front, box.back):   # in case clicking the box focused it
+                win.bind("<space>", lambda e: self.abort_shutdown())
+            self._start_space_hotkey()
             self._tick_countdown()
 
     def _tick_countdown(self):
@@ -821,7 +883,8 @@ class NyxApp:
         left = self.shutdown_deadline - time.time()
         box.set_text("number", str(max(0, math.ceil(left))))
         if left <= 0:
-            box.set_text("sub", "Shutting down…")
+            box.set_text("sub", "Restarting…" if getattr(self, "power_action", "") == "restart"
+                         else "Shutting down…")
         # Flash red: faster in the last 5 seconds.
         period = 0.5 if left > 5 else 0.25
         on = int(time.time() / period) % 2 == 0
@@ -834,6 +897,41 @@ class NyxApp:
         if box is not None:
             box.destroy()
         self.root.unbind("<space>")
+        self._stop_space_hotkey()
+
+    def _start_space_hotkey(self):
+        """During a countdown, Space aborts even when another program is in front.
+        (A system-wide hotkey, released as soon as the countdown ends.)"""
+        if getattr(self, "_hotkey_stop", None) is not None:
+            return
+        stop = self._hotkey_stop = threading.Event()
+
+        def worker():
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            HOTKEY_ID, VK_SPACE, WM_HOTKEY, PM_REMOVE = 0x4E59, 0x20, 0x0312, 1
+            if not user32.RegisterHotKey(None, HOTKEY_ID, 0, VK_SPACE):
+                print("[countdown] Space is taken by another program; it only works "
+                      "while Nyx is the active window.")
+                return
+            try:
+                msg = wintypes.MSG()
+                while not stop.is_set():
+                    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                            self.events.put_nowait({"type": "abort_hotkey"})
+                    stop.wait(0.03)
+            finally:
+                user32.UnregisterHotKey(None, HOTKEY_ID)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_space_hotkey(self):
+        stop = getattr(self, "_hotkey_stop", None)
+        self._hotkey_stop = None
+        if stop is not None:
+            stop.set()
 
     def abort_shutdown(self):
         # The engine emits a "shutdown" event, which hides the countdown
@@ -844,15 +942,16 @@ class NyxApp:
         else:
             self.hide_countdown()
 
-    def show_aborted(self):
-        """Blue 'SHUTDOWN ABORTED' box for a few seconds, then fade out."""
+    def show_aborted(self, action="shutdown"):
+        """Blue 'SHUTDOWN ABORTED' / 'RESTART ABORTED' box for a few seconds, then fade out."""
         old = getattr(self, "aborted_box", None)
         if old is not None:
             old.destroy()
         w, h = self._box_size()
         box = GlassBox(self.root, w, int(h * 0.5), "#60a5fa", tint="#2563eb")
-        box.text(0.42, "SHUTDOWN ABORTED", (self.f_head, 34, "bold"))
-        box.text(0.70, "Your PC will stay on.", (self.f_ui, 14))
+        box.text(0.42, f"{action.upper()} ABORTED", (self.f_head, 34, "bold"))
+        box.text(0.70, "Your PC won't restart." if action == "restart" else "Your PC will stay on.",
+                 (self.f_ui, 14))
         self.aborted_box = box
         self.root.after(3500, lambda: self._fade_aborted(box, 0))
 
@@ -966,13 +1065,17 @@ class NyxApp:
             self.mic_enabled = ev.get("enabled", True)
             self._refresh_mic_button()
             self.set_state(self.state)
+        elif kind == "abort_hotkey":
+            if getattr(self, "countdown_box", None) is not None:
+                self.abort_shutdown()
         elif kind == "shutdown":
             if ev.get("active"):
-                self.show_countdown(ev.get("deadline", time.time() + 20))
+                self.show_countdown(ev.get("deadline", time.time() + 20),
+                                    ev.get("action", "shutdown"))
             else:
                 self.hide_countdown()
                 if ev.get("aborted"):
-                    self.show_aborted()
+                    self.show_aborted(ev.get("action", "shutdown"))
         elif kind == "window":
             if ev.get("action") == "minimize":
                 self.root.after(600, self.minimize)   # let the reply show first
@@ -1010,8 +1113,10 @@ class NyxApp:
             if self.state != "error":
                 self.set_state("stopped")
             if not self.stop_event.is_set() and self.state != "error":
-                # The user said goodbye.
-                self.root.after(1200, self.on_close)
+                if getattr(self.engine, "RESTART_REQUESTED", False):
+                    self.root.after(300, self.restart)      # "Nyx, restart"
+                else:
+                    self.root.after(1200, self.on_close)    # the user said goodbye
 
     def set_state(self, value):
         self.state = value
@@ -1077,6 +1182,10 @@ class NyxApp:
         if self.engine is not None:
             self.engine.SPEECH_VOLUME = int(settings["speech_volume"])
             self.engine.CHAT_LOG_ENABLED = bool(settings["chat_log_enabled"])
+            self.engine.set_speaker(settings.get("speaker", ""))
+            mic = settings.get("microphone", "")
+            if mic != self.engine.MIC_NAME_SETTING:
+                self.engine.set_microphone(mic)
         if rebuild:
             apply_palette(settings)
             self.rebuild_ui()
@@ -1106,7 +1215,16 @@ class NyxApp:
             if not self.engine.cancel_thinking():
                 self.engine.stop_speaking()
 
-    def on_close(self):
+    def restart(self):
+        """Close everything, then start a fresh copy of the app (no console window
+        if this one had none, since it reuses the same python/pythonw)."""
+        import subprocess
+        cmd = self.engine.relaunch_command() if self.engine is not None else \
+            [sys.executable, os.path.abspath(__file__)]
+        self.on_close(after_shutdown=lambda: subprocess.Popen(
+            cmd, cwd=os.path.dirname(os.path.abspath(__file__))))
+
+    def on_close(self, after_shutdown=None):
         self.stop_event.set()
         if self.engine is not None:
             try:
@@ -1118,6 +1236,8 @@ class NyxApp:
         if self.engine is not None:
             self.engine.shutdown_engine()
         self.root.destroy()
+        if after_shutdown is not None:
+            after_shutdown()
         os._exit(0)  # make sure model/audio threads can't keep the process alive
 
     # ------------------------------------------------------------- animation

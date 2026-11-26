@@ -386,6 +386,30 @@ def load_piper():
 TTS_LEAD_SILENCE = 0.15   # Bluetooth headphones often swallow the first syllable
 TTS_TAIL_SILENCE = 0.6    # ...and the last words if the stream closes too early
 
+# Speaker / microphone chosen in Settings ("" = Windows default / automatic).
+SPEAKER_NAME = str(_settings.get("speaker", "") or "")
+MIC_NAME_SETTING = str(_settings.get("microphone", "") or "")
+_MIC_SWITCH_PENDING = False
+
+def _speaker_device():
+    """sounddevice index of the chosen speaker, or None for the Windows default."""
+    if not SPEAKER_NAME:
+        return None
+    try:
+        api = next((i for i, h in enumerate(sd.query_hostapis())
+                    if "directsound" in h["name"].lower()), None)
+        for i, d in enumerate(sd.query_devices()):
+            if d["name"] == SPEAKER_NAME and d["max_output_channels"] > 0                     and (api is None or d["hostapi"] == api):
+                return i
+    except Exception:
+        pass
+    print(f"[-] Speaker '{SPEAKER_NAME}' not found - using the Windows default.")
+    return None
+
+def set_speaker(name):
+    global SPEAKER_NAME
+    SPEAKER_NAME = name or ""
+
 def _play_audio(audio_np, sample_rate):
     global SPEAKING_IN_PROGRESS, STOP_TTS
     try:
@@ -394,7 +418,14 @@ def _play_audio(audio_np, sample_rate):
         audio_np = np.concatenate([lead, audio_np.astype(np.float32), tail])
         duration = len(audio_np) / float(sample_rate)
 
-        sd.play(audio_np, samplerate=sample_rate, latency="high")
+        device = _speaker_device()
+        try:
+            sd.play(audio_np, samplerate=sample_rate, latency="high", device=device)
+        except Exception as exc:
+            if device is None:
+                raise
+            print(f"[-] Speaker '{SPEAKER_NAME}' failed ({exc}) - using the Windows default.")
+            sd.play(audio_np, samplerate=sample_rate, latency="high")
         start = time.time()
         try:
             latency = float(sd.get_stream().latency or 0.0)
@@ -762,15 +793,52 @@ def choose_microphone_index():
     print(f"[+] Selected microphone: {mic_name} (index {chosen}, rms={rms_value:.2f})")
     return chosen
 
+def _find_input_by_name(name):
+    """PyAudio index of the mic called `name` in Settings.
+    Settings lists DirectSound names (full length), but the mic is opened through
+    MME: DirectSound returns garbage samples at 16 kHz. MME cuts names to 31 chars."""
+    try:
+        api = audio_interface.get_host_api_info_by_type(pyaudio.paMME)["index"]
+    except Exception:
+        api = None
+    for i in range(audio_interface.get_device_count()):
+        info = audio_interface.get_device_info_by_index(i)
+        dev = info.get("name") or ""
+        if (dev == name or dev == name[:31]) and int(info.get("maxInputChannels", 0)) > 0                 and (api is None or info.get("hostApi") == api):
+            return i
+    return None
+
+def _windows_default_mic():
+    try:
+        index = int(audio_interface.get_default_input_device_info()["index"])
+        return index if test_microphone(index) is not None else None
+    except Exception:
+        return None
+
 def open_microphone():
     global audio_interface, mic_stream, MIC_DEVICE_INDEX
     audio_interface = pyaudio.PyAudio()
     MIC_DEVICE_INDEX = None
-    for i in range(audio_interface.get_device_count()):
-        name = (audio_interface.get_device_info_by_index(i).get("name") or "").lower()
-        if "hyperx" in name or "duocast" in name:
-            MIC_DEVICE_INDEX = i
-            break
+
+    # Choice from Settings. If it's missing or broken: Windows default, then automatic.
+    if MIC_NAME_SETTING == nyx_settings.MIC_WINDOWS_DEFAULT:
+        MIC_DEVICE_INDEX = _windows_default_mic()
+        if MIC_DEVICE_INDEX is not None:
+            print("[+] Using the Windows default microphone (from Settings).")
+    elif MIC_NAME_SETTING:
+        index = _find_input_by_name(MIC_NAME_SETTING)
+        if index is not None and test_microphone(index) is not None:
+            MIC_DEVICE_INDEX = index
+        else:
+            print(f"[-] Microphone '{MIC_NAME_SETTING}' isn't working - trying the Windows default.")
+            MIC_DEVICE_INDEX = _windows_default_mic()
+    if MIC_DEVICE_INDEX is None:
+        # Automatic: HyperX first...
+        for i in range(audio_interface.get_device_count()):
+            name = (audio_interface.get_device_info_by_index(i).get("name") or "").lower()
+            if "hyperx" in name or "duocast" in name:
+                MIC_DEVICE_INDEX = i
+                break
     if MIC_DEVICE_INDEX is None:
         # Next choice: the mic set as default in Windows sound settings.
         try:
@@ -791,6 +859,34 @@ def open_microphone():
         input_device_index=MIC_DEVICE_INDEX, frames_per_buffer=CHUNK,
     )
     emit("mic_name", value=mic_name)
+
+def set_microphone(name):
+    """Switch mic (from Settings). The listening loop reopens it between commands."""
+    global MIC_NAME_SETTING, _MIC_SWITCH_PENDING
+    MIC_NAME_SETTING = name or ""
+    _MIC_SWITCH_PENDING = True
+
+def _reopen_microphone():
+    global mic_stream, _MIC_SWITCH_PENDING
+    _MIC_SWITCH_PENDING = False
+    emit("state", value="loading", detail="Switching microphone")
+    try:
+        mic_stream.stop_stream()
+        mic_stream.close()
+    except Exception:
+        pass
+    try:
+        audio_interface.terminate()   # a fresh PyAudio also sees newly plugged-in mics
+    except Exception:
+        pass
+    mic_stream = None
+    try:
+        open_microphone()
+        calibrate_noise()
+    except Exception as exc:
+        print(f"[-] Could not switch microphone: {exc}")
+        emit("reply", text=f"I couldn't open a microphone: {exc}")
+    emit("state", value="idle")
 
 def calibrate_noise(seconds=1.2):
     """Measure room noise at startup so the trigger level fits the room."""
@@ -1163,20 +1259,49 @@ def open_application(command_text):
 # PC shutdown abort (voice, GUI button, console spacebar)
 # -------------------------------------------------------------------
 SHUTDOWN_SECONDS = 20
+POWER_ACTION = "shutdown"   # what the pending confirmation / countdown is for: "shutdown" or "restart"
+_SYSTEM_RESTART_RE = re.compile(
+    r"\b(?:restart|reboot)\s+(?:the\s+|my\s+|this\s+)?(?:system|computer|pc|laptop|windows)\b"
+    r"|\b(?:system|computer|pc|laptop)\s+(?:restart|reboot)\b",
+    re.IGNORECASE,
+)
+
+def request_power_action(action):
+    """Ask for confirmation before shutting down or restarting the PC."""
+    global SHUTDOWN_CONFIRMATION_PENDING, POWER_ACTION
+    POWER_ACTION = action
+    SHUTDOWN_CONFIRMATION_PENDING = True
+    return "Confirmation required."
+
+def start_power_countdown():
+    """Confirmed: shut down / restart the PC after SHUTDOWN_SECONDS."""
+    global SHUTDOWN_CONFIRMATION_PENDING, SHUTDOWN_COUNTDOWN_ACTIVE
+    SHUTDOWN_CONFIRMATION_PENDING = False
+    SHUTDOWN_COUNTDOWN_ACTIVE = True
+    flag, verb = ("/r", "Restarting") if POWER_ACTION == "restart" else ("/s", "Shutting down")
+    try:
+        subprocess.run(["shutdown", flag, "/t", str(SHUTDOWN_SECONDS),
+                        "/c", f"System {POWER_ACTION} confirmed."], check=False)
+        emit("shutdown", active=True, deadline=time.time() + SHUTDOWN_SECONDS, action=POWER_ACTION)
+        return f"{verb} the system in {SHUTDOWN_SECONDS} seconds. Say 'abort' to cancel."
+    except Exception as exc:
+        SHUTDOWN_COUNTDOWN_ACTIVE = False
+        return f"Failed to {POWER_ACTION}: {exc}"
 
 def abort_shutdown():
     global SHUTDOWN_CONFIRMATION_PENDING, SHUTDOWN_COUNTDOWN_ACTIVE
     was_counting = SHUTDOWN_COUNTDOWN_ACTIVE
     SHUTDOWN_CONFIRMATION_PENDING = False
     SHUTDOWN_COUNTDOWN_ACTIVE = False
-    emit("shutdown", active=False, aborted=was_counting)
+    emit("shutdown", active=False, aborted=was_counting, action=POWER_ACTION)
+    name = POWER_ACTION.capitalize()
     if not was_counting:
-        return "Shutdown cancelled."
+        return f"{name} cancelled."
     try:
         subprocess.run(["shutdown", "/a"], check=False, capture_output=True)
-        return "Shutdown Aborted."
+        return f"{name} Aborted."
     except Exception as exc:
-        return f"Failed to cancel shutdown: {exc}"
+        return f"Failed to cancel {POWER_ACTION}: {exc}"
 
 # -------------------------------------------------------------------
 # Minimize / restore (the GUI window, or the console window)
@@ -1314,25 +1439,22 @@ def handle_local_tools(command_text):
     # --- PENDING SHUTDOWN CONFIRMATION ---
     if SHUTDOWN_CONFIRMATION_PENDING:
         if re.search(r'\b(confirm|confirmed|yes)\b', lower_text):
-            SHUTDOWN_CONFIRMATION_PENDING = False
-            SHUTDOWN_COUNTDOWN_ACTIVE = True
-            try:
-                subprocess.run(["shutdown", "/s", "/t", str(SHUTDOWN_SECONDS),
-                                "/c", "System shutdown confirmed."], check=False)
-                emit("shutdown", active=True, deadline=time.time() + SHUTDOWN_SECONDS)
-                return f"Shutting down the system in {SHUTDOWN_SECONDS} seconds. Say 'abort' to cancel."
-            except Exception as exc:
-                SHUTDOWN_COUNTDOWN_ACTIVE = False
-                return f"Failed to shutdown: {exc}"
+            return start_power_countdown()
         elif re.search(r'\b(no|nope|cancel|abort|override)\b', lower_text):
             return abort_shutdown()
         else:
             return "Please confirm with 'confirm' or cancel with 'abort'."
 
+    # PC restart ("restart the computer") - checked before Nyx's own restart.
+    if _SYSTEM_RESTART_RE.search(lower_text):
+        return request_power_action("restart")
+
+    if is_restart_request(lower_text):
+        return "__RESTART__"
+
     if re.search(r'\b(bye|goodbye|exit|quit|shutdown|close yourself|close the app)\b', lower_text):
         if re.search(r'\bsystem\b', lower_text):
-            SHUTDOWN_CONFIRMATION_PENDING = True
-            return "Confirmation required."
+            return request_power_action("shutdown")
         return "__EXIT__"
 
     if re.search(r'\b(normal|standard|regular)\b', lower_text):
@@ -1503,6 +1625,23 @@ def set_listening(enabled):
     emit("mic", enabled=LISTENING_ENABLED)
 
 # -------------------------------------------------------------------
+# Restart: "Nyx, restart" closes Nyx and starts a fresh copy of it
+# -------------------------------------------------------------------
+RESTART_REQUESTED = False
+_RESTART_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:restart|reboot|relaunch)(?:\s+(?:please|now))?\s*$"
+    r"|\b(?:restart|reboot|relaunch)\s+(?:yourself|nyx|nix|the\s+(?:assistant|app))\b",
+    re.IGNORECASE,
+)
+
+def is_restart_request(text):
+    return bool(_RESTART_RE.search(re.sub(r"[.,!?]", "", text or "")))
+
+def relaunch_command():
+    """Command line that starts this program again the same way it was started."""
+    return [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+
+# -------------------------------------------------------------------
 # "End task": interrupt Nyx while it is thinking
 # -------------------------------------------------------------------
 CANCEL_THINKING = threading.Event()
@@ -1566,8 +1705,8 @@ def think_cancellable(prompt):
     return result.get("reply", "")
 
 def process_command(command_text):
-    """Run one command. Returns False if the assistant should exit."""
-    global last_assistant_reply, followup_window_until, post_speak_cooldown_until
+    """Run one command. Returns False if the assistant should exit or restart."""
+    global last_assistant_reply, followup_window_until, post_speak_cooldown_until, RESTART_REQUESTED
 
     command_text = (command_text or "").strip()
     if not command_text:
@@ -1615,6 +1754,15 @@ def process_command(command_text):
             post_speak_cooldown_until = time.time() + POST_SPEAK_COOLDOWN
             followup_window_until = 0.0
             return True
+
+    if reply == "__RESTART__":
+        RESTART_REQUESTED = True
+        emit("reply", text="Restarting…")
+        speak("Restarting.")
+        print("\n[Restarting] Restart requested by user.")
+        while SPEAKING_IN_PROGRESS:
+            time.sleep(0.05)
+        return False
 
     if reply == "__EXIT__":
         emit("reply", text="Goodbye sir.")
@@ -1668,14 +1816,15 @@ def _handle_keyboard():
         return
     key = msvcrt.getch()
     if key == b' ':
-        try:
-            res = subprocess.run(["shutdown", "/a"], capture_output=True, text=True)
-            if res.returncode == 0:
-                SHUTDOWN_CONFIRMATION_PENDING = False
-                SHUTDOWN_COUNTDOWN_ACTIVE = False
-                speak("Shutdown Aborted")
-        except Exception as exc:
-            print(f"Error checking spacebar abort: {exc}")
+        if SHUTDOWN_CONFIRMATION_PENDING or SHUTDOWN_COUNTDOWN_ACTIVE:
+            speak(abort_shutdown())
+        else:
+            # Still cancels a shutdown/restart that wasn't started by Nyx.
+            try:
+                if subprocess.run(["shutdown", "/a"], capture_output=True).returncode == 0:
+                    speak("Aborted")
+            except Exception as exc:
+                print(f"Error checking spacebar abort: {exc}")
     elif key in (b'm', b'M'):
         set_listening(not LISTENING_ENABLED)
         speak("Microphone on" if LISTENING_ENABLED else "Microphone off")
@@ -1719,6 +1868,14 @@ def run_loop(stop_event=None, text_queue=None, use_keyboard=False):
         if SPEAKING_IN_PROGRESS:
             was_speaking = True
             time.sleep(0.05)
+            continue
+
+        if _MIC_SWITCH_PENDING:
+            _reopen_microphone()
+            pre_roll_buffer.clear()
+            continue
+        if mic_stream is None:   # switching failed and no mic is open
+            time.sleep(0.2)
             continue
 
         now = time.time()
@@ -1810,3 +1967,7 @@ if __name__ == "__main__":
         print("\n[Exiting] Shutting down background streams...")
     finally:
         shutdown_engine()
+    if RESTART_REQUESTED:
+        # The new copy shares this console window.
+        subprocess.Popen(relaunch_command(), cwd=str(APP_DIR))
+        os._exit(0)

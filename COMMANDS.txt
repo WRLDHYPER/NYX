@@ -94,23 +94,28 @@ MINIMIZE / RESTORE
   In the console version these minimize / restore the console window.
 
 
-SHUTTING DOWN THE PC
---------------------
+SHUTTING DOWN / RESTARTING THE PC
+---------------------------------
   "Nyx, shutdown system"             Nyx asks for confirmation
-  "confirm"  (or "yes")              PC shuts down in 20 seconds
+  "Nyx, restart the computer"        Same, but restarts the PC
+        also: "restart the system", "reboot my pc", "restart windows"
+  "confirm"  (or "yes")              PC shuts down / restarts in 20 seconds
                                      (a big flashing red countdown box
                                      appears in the app)
   "abort"    (or "cancel", "override", "no")
-                                     Cancels the shutdown (a blue
-                                     "SHUTDOWN ABORTED" box appears).
+                                     Cancels it (a blue "SHUTDOWN ABORTED"
+                                     or "RESTART ABORTED" box appears).
                                      In the app you can also click ABORT
                                      or press Space.
 
 
-CLOSING NYX
------------
+CLOSING / RESTARTING NYX
+------------------------
   "Nyx, goodbye"
         also: "bye", "exit", "quit", "close yourself", "close the app"
+  "Nyx, restart"                     Closes Nyx and starts it again
+        also: "restart yourself", "reboot yourself", "restart the assistant"
+        ("restart the computer" does NOT trigger this.)
 
 
 KEYBOARD SHORTCUTS
@@ -120,7 +125,8 @@ KEYBOARD SHORTCUTS
     Esc        Stop Nyx talking / end task while thinking
     Ctrl+L     Clear the conversation
     F11        Fullscreen on / off
-    Ctrl+,     Settings (theme, orb colours, voice volume, chat log)
+    Ctrl+,     Settings (theme, orb colours, voice volume, speaker,
+               microphone, chat log)
     Ctrl+H     Minimize
     Space      Abort a shutdown (while the countdown is showing)
     Alt+F4     Close the app

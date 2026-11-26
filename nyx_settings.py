@@ -86,7 +86,37 @@ DEFAULTS = {
     "chat_log_enabled": True,     # save conversations to previous_chats.txt
     "start_fullscreen": True,
     "speech_volume": 100,         # Nyx's voice, 0-100
+    "speaker": "",                # "" = Windows default, else a device name
+    "microphone": "",             # "" = automatic, MIC_WINDOWS_DEFAULT, or a device name
 }
+
+MIC_WINDOWS_DEFAULT = "__windows_default__"
+
+# Names PortAudio uses for "whatever Windows has as default" - not real devices.
+_PSEUDO_DEVICES = ("primary sound", "sound mapper")
+
+
+def list_audio_devices(kind, refresh=False):
+    """Names of the speakers (kind="output") or microphones (kind="input").
+    Uses DirectSound: it lists each device once, with its full name.
+    refresh=True re-scans, picking up devices plugged in after start-up
+    (only safe while nothing is playing through sounddevice)."""
+    import sounddevice as sd
+    if refresh:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+    channels = "max_output_channels" if kind == "output" else "max_input_channels"
+    api = next((i for i, h in enumerate(sd.query_hostapis()) if "directsound" in h["name"].lower()),
+               None)
+    names = []
+    for d in sd.query_devices():
+        name = d["name"]
+        if (api is None or d["hostapi"] == api) and d[channels] > 0                 and not any(p in name.lower() for p in _PSEUDO_DEVICES) and name not in names:
+            names.append(name)
+    return names
 
 
 def load():

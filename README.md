@@ -187,9 +187,10 @@ The first start takes a little while (loading the models). When Nyx says
 - **Nyx doesn't wake up / wakes up too easily**: in `assistant.py`, lower or raise
   `NOISE_MULTIPLIER` and `MIN_TRIGGER_RMS`. Set `WAKE_WORD_DEBUG = True` to see
   live microphone levels in the console.
-- **Wrong microphone**: Nyx prefers HyperX/DuoCast mics, then the Windows default
-  mic, then the loudest working mic. Set your mic as the Windows default
-  (Settings → System → Sound → Input), or edit `open_microphone()` in `assistant.py`.
+- **Wrong microphone or speaker**: pick them in the app under Settings (Ctrl+,) →
+  Audio devices. A mic left on Automatic prefers HyperX/DuoCast, then the Windows
+  default mic, then the loudest working mic. If a chosen device is unplugged, Nyx
+  falls back to the Windows default.
 - **No voice**: check that the two voice files from step 5 are in `voices`.
 - **Volume control doesn't work**: run `py -3.11 -m pip install pycaw comtypes`, or install
   [NirCmd](https://www.nirsoft.net/utils/nircmd.html) and put it on your PATH.
