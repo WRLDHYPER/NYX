@@ -158,13 +158,18 @@ for %%M in (%OLLAMA_MODELS%) do (
 rem ===========================================================================
 rem  6. Shortcuts (Desktop + Start Menu)
 rem ===========================================================================
+call :step "Building NYX.exe"
+call "%APPDIR%tools\build_exe.bat" >nul
+if errorlevel 1 (echo     Could not build NYX.exe - the shortcut will start Nyx with Python instead.) else (echo     NYX.exe built.)
+
 call :step "Creating shortcuts"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ws = New-Object -ComObject WScript.Shell;" ^
   "foreach ($dir in [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs')) {" ^
   "  $s = $ws.CreateShortcut((Join-Path $dir 'NYX.lnk'));" ^
-  "  $s.TargetPath = $env:VPYW;" ^
-  "  $s.Arguments = '\"' + $env:APPDIR + 'nyx_app.py\"';" ^
+  "  if (Test-Path ($env:APPDIR + 'NYX.exe')) { $s.TargetPath = $env:APPDIR + 'NYX.exe' }" ^
+  "  else { $s.TargetPath = $env:VPYW; $s.Arguments = '\"' + $env:APPDIR + 'nyx_app.py\"' };" ^
+  "  if (Test-Path ($env:APPDIR + 'assets\nyx.ico')) { $s.IconLocation = $env:APPDIR + 'assets\nyx.ico' };" ^
   "  $s.WorkingDirectory = $env:APPDIR;" ^
   "  $s.Description = 'NYX voice assistant';" ^
   "  $s.Save() }"
@@ -178,7 +183,7 @@ echo.
 set "RUN="
 set /p "RUN=Start Nyx now? (Y/n) "
 if /i "%RUN%"=="n" exit /b 0
-start "" "%VPYW%" "%APPDIR%nyx_app.py"
+if exist "%APPDIR%NYX.exe" (start "" "%APPDIR%NYX.exe") else (start "" "%VPYW%" "%APPDIR%nyx_app.py")
 exit /b 0
 
 

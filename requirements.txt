@@ -11,3 +11,4 @@ requests
 pycaw
 comtypes
 screen-brightness-control
+ddgs

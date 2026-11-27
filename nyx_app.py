@@ -423,6 +423,10 @@ class SettingsWindow:
                              "mode colour while deep mode is on.",
                  bg=PANEL, fg=FAINT, font=(f_ui, 8), justify="left").pack(anchor="w", pady=(4, 0))
 
+        self._section(right, "INTERNET")
+        self._check(right, "Search the web for things Nyx doesn't know\n(uses DuckDuckGo)",
+                    "web_search_enabled")
+
         self._section(right, "WINDOW")
         self._check(right, "Start in fullscreen (F11 switches any time)", "start_fullscreen")
 
@@ -1052,6 +1056,8 @@ class NyxApp:
             if value == "loading":
                 self.hint_label.configure(text=ev.get("detail", "") + "…")
             self.set_state(value)
+            if value != "loading" and ev.get("detail"):   # e.g. "Searching the web"
+                self.hint_label.configure(text=ev["detail"] + "…")
         elif kind == "level":
             self.level_rms = ev.get("rms", 0.0)
             self.threshold_rms = max(1.0, ev.get("threshold", 1.0))
@@ -1059,6 +1065,13 @@ class NyxApp:
             self.add_user(ev.get("text", ""))
         elif kind == "heard":
             pass  # the cleaned command is shown via "user"
+        elif kind == "web":
+            sites = ", ".join(ev.get("sources", []))
+            msg = f"Searched the web for “{ev.get('query', '')}”" + (f"  ·  {sites}" if sites else "")
+            links = ev.get("links") or []
+            if links:
+                msg += "\nProfiles found:\n" + "\n".join("  " + link for link in links)
+            self._system(msg)
         elif kind == "reply":
             self.add_nyx(ev.get("text", ""), ev.get("kind"))
         elif kind == "mic":
@@ -1182,6 +1195,7 @@ class NyxApp:
         if self.engine is not None:
             self.engine.SPEECH_VOLUME = int(settings["speech_volume"])
             self.engine.CHAT_LOG_ENABLED = bool(settings["chat_log_enabled"])
+            self.engine.WEB_SEARCH_ENABLED = bool(settings.get("web_search_enabled", True))
             self.engine.set_speaker(settings.get("speaker", ""))
             mic = settings.get("microphone", "")
             if mic != self.engine.MIC_NAME_SETTING:
@@ -1258,13 +1272,105 @@ class NyxApp:
         self.root.after(16, self._frame)
 
 
+APP_ID = "Nyx.Assistant"    # taskbar identity; NYX.exe stamps the same ID on its shortcuts
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _keep_taskbar_identity(root, icon):
+    """Tk replaces its top-level window when fullscreen is switched on or off,
+    which drops the taskbar properties - so re-apply them whenever that happens."""
+    import ctypes
+    last = [None]
+
+    def check(event=None):
+        if event is not None and event.widget is not root:
+            return
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        if hwnd and hwnd != last[0]:
+            last[0] = hwnd
+            try:
+                _set_taskbar_identity(hwnd, icon)
+            except Exception as e:
+                print("Could not set taskbar identity:", e)
+
+    root.update_idletasks()
+    check()
+    root.bind("<Configure>", check, add="+")
+    root.bind("<Map>", check, add="+")
+
+
+def _set_taskbar_identity(hwnd, icon):
+    """Tell the taskbar this window is NYX: group it under APP_ID, and if it gets
+    pinned, relaunch it with NYX.exe and show the NYX icon (not pythonw's)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD),
+                    ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
+
+    class PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+    class PROPVARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort),
+                    ("r3", ctypes.c_ushort), ("val", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
+
+    # {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}: System.AppUserModel.*
+    fmtid = GUID(0x9F4C2855, 0x9F79, 0x4B39, (ctypes.c_ubyte * 8)(0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3))
+    iid = GUID(0x886D8EEB, 0x8CF2, 0x4446, (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
+    exe = os.path.join(APP_DIR, "NYX.exe")
+    props = [(5, APP_ID)]                                   # ID
+    if os.path.exists(exe):
+        props += [(2, f'"{exe}"'),                          # RelaunchCommand
+                  (4, "NYX")]                               # RelaunchDisplayNameResource
+        if os.path.exists(icon):
+            props.append((3, f"{icon},0"))                  # RelaunchIconResource
+        # RelaunchCommand/RelaunchDisplayNameResource must be set before ID
+        props = props[1:] + props[:1]
+
+    store = ctypes.c_void_p()
+    hr = ctypes.windll.shell32.SHGetPropertyStoreForWindow(
+        wintypes.HWND(hwnd), ctypes.byref(iid), ctypes.byref(store))
+    if hr != 0:
+        raise OSError(f"SHGetPropertyStoreForWindow failed: {hr & 0xFFFFFFFF:#x}")
+    vtbl = ctypes.cast(ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0],
+                       ctypes.POINTER(ctypes.c_void_p))
+    proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                               ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))
+    set_value = proto(vtbl[6])                              # IPropertyStore::SetValue
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+    try:
+        for pid, text in props:
+            buf = ctypes.create_unicode_buffer(text)
+            pv = PROPVARIANT(vt=31, val=ctypes.cast(buf, ctypes.c_void_p))   # VT_LPWSTR
+            hr = set_value(store, ctypes.byref(PROPERTYKEY(fmtid, pid)), ctypes.byref(pv))
+            if hr != 0:
+                raise OSError(f"setting taskbar property {pid} failed: {hr & 0xFFFFFFFF:#x}")
+    finally:
+        release(store)
+
+
 def main():
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)   # crisp text on high-DPI screens
     except Exception:
         pass
+    try:
+        from ctypes import windll
+        # Own taskbar identity, so Windows shows the NYX icon rather than Python's.
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        pass
     root = tk.Tk()
+    icon = os.path.join(APP_DIR, "assets", "nyx.ico")
+    if os.path.exists(icon):
+        try:
+            root.iconbitmap(default=icon)    # default= also covers the settings window
+        except tk.TclError:
+            pass
+    _keep_taskbar_identity(root, icon)
     NyxApp(root)
     root.mainloop()
 

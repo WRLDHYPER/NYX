@@ -3,7 +3,8 @@
 Nyx is a voice assistant that runs entirely on your own PC. Say **"Nyx"** and
 then a command. It can open apps and websites, set the volume and brightness,
 tell you the time, read files, shut down the PC, and answer questions using a
-local AI model.
+local AI model. For things the model doesn't know (news, scores, prices, recent
+events) it searches the web through DuckDuckGo; you can turn that off in Settings.
 
 - Speech-to-text: **faster-whisper** (Whisper large-v3)
 - Voice: **Piper** text-to-speech
@@ -129,7 +130,9 @@ whichever voice it finds in the folder.
 
 ## 6. Start Nyx
 
-**The app (recommended):** double-click **`run_app.bat`**, or from Command Prompt:
+**The app (recommended):** double-click **`NYX.exe`** (or `run_app.bat`). You can
+right-click `NYX.exe` → *Pin to taskbar / Start*. `setup.bat` builds `NYX.exe`;
+if you installed by hand, build it with `tools\build_exe.bat`. Or from Command Prompt:
 
 ```cmd
 cd /d C:\NYX
@@ -206,6 +209,9 @@ The first start takes a little while (loading the models). When Nyx says
 | `settings.json` | Your settings (saved as soon as you change one in Settings) |
 | `assistant.py` | The engine: listening, speech-to-text, commands, voice |
 | `setup.bat` | Downloads and installs everything Nyx needs |
+| `NYX.exe` | Starts the app (no console window), with the NYX icon. Built by `setup.bat`, not stored in git |
+| `assets/` | The NYX logo (`nyx.ico`, `nyx.png`) |
+| `tools/` | `make_icon.py` redraws the logo, `build_exe.bat` rebuilds `NYX.exe` |
 | `run_app.bat` | Starts the app |
 | `run_assistant.bat` | Starts the console version |
 | `COMMANDS.txt` | Everything you can say to Nyx |

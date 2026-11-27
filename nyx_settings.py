@@ -88,6 +88,7 @@ DEFAULTS = {
     "speech_volume": 100,         # Nyx's voice, 0-100
     "speaker": "",                # "" = Windows default, else a device name
     "microphone": "",             # "" = automatic, MIC_WINDOWS_DEFAULT, or a device name
+    "web_search_enabled": True,   # search the internet (DuckDuckGo) for things Nyx doesn't know
 }
 
 MIC_WINDOWS_DEFAULT = "__windows_default__"

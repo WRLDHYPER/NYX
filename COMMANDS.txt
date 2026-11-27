@@ -66,6 +66,22 @@ FILES & CHAT HISTORY
         also: "say that again", "what did you say", "repeat"
 
 
+SEARCHING THE WEB
+-----------------
+  "Nyx, search for <anything>"       Searches the internet and answers
+        also: "look up ...", "google ...", "search the web for ..."
+  Nyx also searches by itself when a question needs fresh information
+  (latest, current, news, weather, prices, scores, "who won", years like
+  2026) or when the AI model says it doesn't know. The chat shows which
+  sites were used. Turn it off in Settings -> Internet.
+  "Nyx, search for Sandra Sanchez karate"
+        Searches the whole web AND Facebook, Instagram, LinkedIn, X, TikTok
+        and YouTube (done for names and questions about people). Profile
+        links appear in the chat.
+  "Nyx, find Sandra Sanchez on Instagram"
+        Naming a site searches only that site.
+
+
 THINKING MODES
 --------------
   "Nyx, deep mode"                   Use the smarter (slower) AI model

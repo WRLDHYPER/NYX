@@ -1554,29 +1554,251 @@ def ask_ollama_dual(prompt):
         "Keep your responses concise, conversational, and under 2-3 sentences. "
         "Never use markdown formatting, bolding, emojis, or bullet points."
     )
-    payload = {
-        "model": selected_model,
-        "prompt": prompt,
-        "system": system_instructions,
-        "stream": False
-    }
+    if not WEB_SEARCH_ENABLED:
+        return _ask_model(url, selected_model, prompt, system_instructions)
+
+    # 1. "search for X" / questions that obviously need fresh information: search first.
+    explicit = _EXPLICIT_SEARCH_RE.match(prompt.strip())
+    if explicit or _NEEDS_FRESH_RE.search(prompt) or _SOCIAL_WORD_RE.search(prompt):
+        query = explicit.group(1).strip() if explicit else prompt
+        return _answer_from_web(url, selected_model, prompt, query, system_instructions)
+
+    # 2. Otherwise the model answers first; search only if it sounds like it doesn't know.
+    #    (Small models ignore "only search when unsure" and would search for everything.)
+    reply = _ask_model(url, selected_model, prompt, system_instructions + _date_hint())
+    if _UNSURE_RE.search(reply or "") and not CANCEL_THINKING.is_set():
+        print("[web] The model wasn't sure - searching.")
+        return _answer_from_web(url, selected_model, prompt, prompt, system_instructions)
+    return reply
+
+def _ask_model(url, model, prompt, system):
+    """One Ollama answer. Falls back to the fast model if the smart one fails."""
+    payload = {"model": model, "prompt": prompt, "system": system, "stream": False}
     try:
         return _ollama_generate(url, payload)
     except Exception as err:
-        if selected_model == SMART_MODEL:
+        if model == SMART_MODEL:
             try:
-                fallback_payload = {
-                    "model": FAST_MODEL,
-                    "prompt": prompt,
-                    "system": system_instructions,
-                    "stream": False,
-                }
-                fallback_reply = _ollama_generate(url, fallback_payload)
+                fallback_reply = _ollama_generate(url, dict(payload, model=FAST_MODEL))
                 if not fallback_reply.startswith("Ollama HTTP Error"):
                     return fallback_reply
             except Exception:
                 pass
         return f"Error connecting to Ollama backend: {err}"
+
+# -------------------------------------------------------------------
+# Web search (DuckDuckGo - no account or API key needed)
+# -------------------------------------------------------------------
+WEB_SEARCH_ENABLED = bool(_settings.get("web_search_enabled", True))
+WEB_RESULTS = 10          # results per search
+WEB_PAGES_TO_READ = 3     # top pages opened and read, on top of the search snippets
+WEB_PER_SITE = 2          # max results from one site, so Wikipedia can't fill the list
+
+# Social sites searched for people / profiles, and the words you'd use for them.
+SOCIAL_SITES = {
+    "facebook.com": ("facebook", "fb"),
+    "instagram.com": ("instagram", "insta"),
+    "linkedin.com": ("linkedin",),
+    "x.com": ("twitter",),
+    "tiktok.com": ("tiktok", "tik tok"),
+    "youtube.com": ("youtube",),
+}
+_PERSON_RE = re.compile(
+    r"\b(?:who\s+is|who's|person|people|someone|somebody|guy|girl|man|woman|boy|named|called"
+    r"|profile|account|social\s+media|facebook|fb|instagram|insta|linkedin|tiktok|twitter)\b",
+    re.IGNORECASE,
+)
+WEB_SOCIAL_MAX = 4        # social results added to a normal search (more if you name a site)
+# Names: two or more capitalised words in a row ("Sandra Sanchez").
+_NAME_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
+# Naming a social site always means "search the web".
+_SOCIAL_WORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for ws in SOCIAL_SITES.values() for w in ws) + r")\b",
+    re.IGNORECASE,
+)
+_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
+_EXPLICIT_SEARCH_RE = re.compile(
+    r"^(?:please\s+)?(?:search(?:\s+(?:the\s+)?(?:web|internet|online))?(?:\s+for)?|google"
+    r"|look\s+up|look\s+online\s+for|find\s+online)\s+(.+)$",
+    re.IGNORECASE,
+)
+_NEEDS_FRESH_RE = re.compile(
+    r"\b(?:latest|newest|recently|today'?s|tonight|yesterday|this\s+(?:week|month|year)"
+    r"|right\s+now|current|news|headlines|price\s+of|stock\s+price|weather|forecast|score|who\s+won"
+    r"|release\s+date|20[2-9]\d)\b",
+    re.IGNORECASE,
+)
+
+def _today():
+    return datetime.date.today().strftime("%A, %B %d, %Y")
+
+def _date_hint():
+    return (f" Today's date is {_today()}. If you don't know something or it may have "
+            "changed since your training, say \"I don't know\" instead of guessing.")
+
+# Phrases that mean the model doesn't actually know the answer.
+_UNSURE_RE = re.compile(
+    r"\bI (?:don'?t|do not) (?:know|have (?:access|information|real-time|current|up-to-date|the latest))"
+    r"|\bI'?m not (?:sure|certain|aware)|\bI am not (?:sure|certain|aware)"
+    r"|\b(?:as of|since) my (?:last|knowledge|training)|\bknowledge cut-?off"
+    r"|\b(?:can'?t|cannot|unable to)\s+(?:\w+\s+)?(?:browse|access|search|look up|check)"
+    r"|\breal-time (?:data|information)|\bno (?:information|data) (?:on|about)"
+    r"|\bI couldn'?t find|\bI have no way of knowing|\bcheck (?:a|an|the) (?:reliable|official|news)",
+    re.IGNORECASE,
+)
+
+def _site_of(url):
+    host = re.sub(r"^https?://", "", url or "").split("/")[0].lower()
+    host = re.sub(r"^(?:www|m|mobile)\.", "", host)
+    if host.endswith("wikipedia.org"):
+        return "wikipedia.org"          # en./es./... count as one site
+    return host
+
+
+def _search_once(query, max_results):
+    """One query, trying a few engines: any single one sometimes returns nothing."""
+    from ddgs import DDGS
+    last_error = None
+    for backend in ("auto", "bing", "google"):
+        if CANCEL_THINKING.is_set():
+            return []
+        try:
+            results = DDGS(timeout=10).text(query, max_results=max_results, backend=backend)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if results:
+            return [{"title": r.get("title", ""), "body": r.get("body", ""),
+                     "url": r.get("href", "")} for r in results]
+    if last_error:
+        print(f"[web] All search engines failed for {query!r}: {last_error}")
+    return []
+
+
+def _social_query(query):
+    """Site-restricted query for profiles: only the sites named, else all of them.
+    Returns (query, only_named_sites)."""
+    lower = query.lower()
+    named = [site for site, words in SOCIAL_SITES.items()
+             if any(re.search(rf"\b{re.escape(w)}\b", lower) for w in words)]
+    # Drop the filler so the search is about the person, not the words "on facebook".
+    site_words = [w for ws in SOCIAL_SITES.values() for w in ws]
+    filler = r"\b(?:on|from|in|find|search(?:\s+for)?|look\s+up|profile|account|social\s+media|" \
+             + "|".join(re.escape(w) for w in site_words) + r")\b"
+    core = re.sub(r"\s+", " ", re.sub(filler, " ", query, flags=re.IGNORECASE)).strip(" ,.?!")
+    sites = named or list(SOCIAL_SITES)
+    return (core or query) + " (" + " OR ".join(f"site:{s}" for s in sites) + ")", bool(named)
+
+
+def web_search(query, max_results=WEB_RESULTS):
+    """Results from the whole web, at most WEB_PER_SITE per site. Questions about a
+    person also search social sites (only the ones named, if any are)."""
+    from concurrent.futures import ThreadPoolExecutor
+    want_people = _PERSON_RE.search(query) or _NAME_RE.search(query)
+    social_q, only_social = _social_query(query) if want_people else (None, False)
+    queries = [social_q] if only_social else [query] + ([social_q] if social_q else [])
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        batches = list(pool.map(lambda q: _search_once(q, max_results), queries))
+    general = [] if only_social else batches[0]
+    social = batches[-1] if social_q else []
+
+    picked, per_site, seen = [], {}, set()
+    social_left = 2 * WEB_SOCIAL_MAX if only_social else WEB_SOCIAL_MAX
+    for r in general + social:
+        site = _site_of(r["url"])
+        is_social = site in SOCIAL_SITES
+        if not r["url"] or r["url"] in seen or per_site.get(site, 0) >= WEB_PER_SITE:
+            continue
+        if is_social and r in social:
+            if social_left <= 0:
+                continue
+            social_left -= 1
+        seen.add(r["url"])
+        per_site[site] = per_site.get(site, 0) + 1
+        picked.append(dict(r, social=is_social))
+    return picked
+
+
+_STOP_WORDS = {"the", "and", "who", "what", "for", "that", "does", "with", "from", "search",
+               "find", "about", "this", "are", "was", "how", "his", "her", "him", "she"}
+
+
+def _page_text(url, question, limit=1500):
+    """The parts of a web page most related to the question, as plain text."""
+    import html as html_lib
+    # Wikipedia rate-limits scripts posing as browsers; it wants an honest client name.
+    headers = {"User-Agent": "NyxVoiceAssistant/1.0 (personal desktop assistant)"} \
+        if _site_of(url) == "wikipedia.org" else _UA
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200 or "html" not in resp.headers.get("content-type", ""):
+            return ""
+        page = resp.text[:600_000]
+    except Exception:
+        return ""
+    page = re.sub(r"(?is)<(script|style|noscript|svg|nav|footer|header|form)\b.*?</\1>", " ", page)
+    text = html_lib.unescape(re.sub(r"(?s)<[^>]+>", " ", page))
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    chunks = [c.strip() for c in re.split(r"(?<=[.!?])\s+|\n\s*\n", text) if len(c.strip()) > 40]
+    terms = {w for w in re.findall(r"[a-z0-9]{3,}", question.lower()) if w not in _STOP_WORDS}
+    ranked = sorted(range(len(chunks)), key=lambda i: -sum(t in chunks[i].lower() for t in terms))
+    keep, size = [], 0
+    for i in ranked:
+        if size + len(chunks[i]) <= limit:
+            keep.append(i)
+            size += len(chunks[i]) + 1
+    return " ".join(chunks[i].replace("\n", " ") for i in sorted(keep))
+
+
+def _answer_from_web(url, model, question, query, system):
+    from concurrent.futures import ThreadPoolExecutor
+    emit("state", value="thinking", detail="Searching the web")
+    print(f"[web] Searching: {query}")
+    try:
+        results = web_search(query)
+    except Exception as exc:
+        print(f"[web] Search failed: {exc}")
+        results = []
+    if CANCEL_THINKING.is_set():
+        return ""
+    if not results:
+        return "I tried to search the internet, but I couldn't get any results. Check your connection."
+
+    sites = []
+    for r in results:
+        if _site_of(r["url"]) not in sites:
+            sites.append(_site_of(r["url"]))
+    profiles = [r["url"] for r in results if r["social"]][:4]
+    emit("web", query=query, sources=sites[:6], links=profiles)
+
+    # Read the top few normal pages (social sites need a login, so only their snippets count).
+    emit("state", value="thinking", detail="Reading the pages")
+    # Fetch a few extra in parallel, and use the first WEB_PAGES_TO_READ that worked.
+    to_read = [r for r in results if not r["social"]][:WEB_PAGES_TO_READ + 3]
+    texts = []
+    if to_read:
+        with ThreadPoolExecutor(max_workers=len(to_read)) as pool:
+            texts = list(pool.map(lambda r: _page_text(r["url"], question), to_read))
+    if CANCEL_THINKING.is_set():
+        return ""
+    page_info = dict([(r["url"], t) for r, t in zip(to_read, texts) if t][:WEB_PAGES_TO_READ])
+    print(f"[web] {len(results)} results from {len(sites)} sites, read {len(page_info)} pages.")
+
+    lines = []
+    for r in results:
+        line = f"- [{_site_of(r['url'])}] {r['title']}: {r['body']}"
+        if r["url"] in page_info:
+            line += f"\n  From the page: {page_info[r['url']]}"
+        lines.append(line)
+    prompt = (
+        f"Today's date is {_today()}. Web search results for \"{query}\":\n" + "\n".join(lines)
+        + f"\n\nUsing these results, answer the user's question: {question}\n"
+        "If the question is about a person, say who they are and which sites have their "
+        "profiles (for example Facebook or Instagram). If the results don't answer it, say "
+        "you couldn't find it. Don't read out web addresses."
+    )
+    return _ask_model(url, model, prompt, system)
 
 # -------------------------------------------------------------------
 # Engine start-up
